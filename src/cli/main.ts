@@ -8,7 +8,7 @@ import type { WatchOptions } from "../core.js";
 program
     .name("watchdiff")
     .description("Lightweight web change monitoring - clean diffs, no AI required.")
-    .version("0.1.2");
+    .version("0.1.3");
 
 // ---------------------------------------------------------------------------
 // run
