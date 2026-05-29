@@ -14,7 +14,7 @@ export type ChangeType = "added" | "removed" | "modified" | "unchanged";
 // Configuration
 // ---------------------------------------------------------------------------
 
-export type DiffMode = "line" | "semantic";
+export type DiffMode = "line" | "semantic" | "word" | "json";
 
 export interface BrowserOptions {
     /** Navigation event to wait for before extracting content (default: "domcontentloaded"). */
@@ -28,10 +28,17 @@ export interface BrowserOptions {
 export interface AlertConfig {
     /** Callbacks invoked with a DiffReport on each change. */
     onChange: Array<(report: DiffReport) => void | Promise<void>>;
-    /** Webhook URLs - Discord, Slack, or custom HTTP endpoints. */
+    /** Webhook URLs - Discord, Slack, Telegram, Teams, ntfy.sh or custom HTTP endpoints. */
     webhooks: string[];
     /** Minimum number of changes required to trigger an alert. */
     minChanges: number;
+}
+
+export interface SilenceInfo {
+    url: string;
+    label: string;
+    /** Seconds elapsed since the last detected change (or since monitoring started). */
+    secondsSinceLastChange: number;
 }
 
 export interface WatchConfig {
@@ -58,10 +65,31 @@ export interface WatchConfig {
     proxies?: string[];
     /** List of User-Agent strings to rotate through on each request. */
     userAgents?: string[];
-    /** "line" = line-by-line diff (default), "semantic" = diff by semantic blocks. */
+    /** "line" = line-by-line diff (default), "semantic" = diff by semantic blocks,
+     *  "word" = word-level diff, "json" = structured JSON diff. */
     diffMode?: DiffMode;
     /** Minimum seconds between two consecutive alerts for this URL (anti-spam). */
     cooldown?: number;
+    /** Number of fetch retries on error before giving up (default 0). */
+    retries?: number;
+    /** Base delay in milliseconds between retries - doubles on each attempt (default 1000). */
+    retryDelay?: number;
+    /** Interval randomisation factor 0-1. 0.2 = ±20% variance (default 0 = no jitter). */
+    jitter?: number;
+    /** When true: fetch and diff but do not save snapshots or fire alerts. */
+    dryRun?: boolean;
+    /** Keep only the last N snapshots per URL (undefined = keep all). */
+    maxSnapshots?: number;
+    /** Minimum fraction 0-1 of content that must change before alerting (default 0 = any change). */
+    changeThreshold?: number;
+    /** Strip standalone numbers from text before diffing to ignore counter/date noise. */
+    ignoreNumbers?: boolean;
+    /** Fire onSilence after this many seconds without a detected change (undefined = disabled). */
+    alertIfNoChangeAfter?: number;
+    /** Called on every fetch or parse error instead of just logging to console. */
+    onError?: (err: Error, config: WatchConfig) => void;
+    /** Called when alertIfNoChangeAfter seconds have elapsed without a detected change. */
+    onSilence?: (info: SilenceInfo) => void;
     alert?: AlertConfig;
 }
 
@@ -71,20 +99,30 @@ export function makeWatchConfig(
 ): WatchConfig {
     return {
         url,
-        target:           opts.target,
-        interval:         opts.interval ?? 300,
-        label:            opts.label ?? url,
-        headers:          opts.headers ?? {},
-        timeout:          opts.timeout ?? 15_000,
-        ignoreSelectors:  opts.ignoreSelectors ?? [],
-        ignorePatterns:   opts.ignorePatterns ?? [],
-        browser:          opts.browser,
-        browserOptions:   opts.browserOptions,
-        proxies:          opts.proxies,
-        userAgents:       opts.userAgents,
-        diffMode:         opts.diffMode,
-        cooldown:         opts.cooldown,
-        alert:            opts.alert,
+        target:                 opts.target,
+        interval:               opts.interval ?? 300,
+        label:                  opts.label ?? url,
+        headers:                opts.headers ?? {},
+        timeout:                opts.timeout ?? 15_000,
+        ignoreSelectors:        opts.ignoreSelectors ?? [],
+        ignorePatterns:         opts.ignorePatterns ?? [],
+        browser:                opts.browser,
+        browserOptions:         opts.browserOptions,
+        proxies:                opts.proxies,
+        userAgents:             opts.userAgents,
+        diffMode:               opts.diffMode,
+        cooldown:               opts.cooldown,
+        retries:                opts.retries,
+        retryDelay:             opts.retryDelay,
+        jitter:                 opts.jitter,
+        dryRun:                 opts.dryRun,
+        maxSnapshots:           opts.maxSnapshots,
+        changeThreshold:        opts.changeThreshold,
+        ignoreNumbers:          opts.ignoreNumbers,
+        alertIfNoChangeAfter:   opts.alertIfNoChangeAfter,
+        onError:                opts.onError,
+        onSilence:              opts.onSilence,
+        alert:                  opts.alert,
     };
 }
 
@@ -125,18 +163,19 @@ export interface Change {
     kind: ChangeType;
     before?: string;
     after?: string;
-    /** Surrounding text hint for context. */
+    /** Surrounding text hint for context (also used as JSON key path in "json" mode). */
     context?: string;
 }
 
 export function changeHuman(change: Change): string {
+    const ctx = change.context ? ` (${change.context})` : "";
     switch (change.kind) {
         case "added":
-            return `[+] Added: ${JSON.stringify(change.after)}`;
+            return `[+] Added${ctx}: ${JSON.stringify(change.after)}`;
         case "removed":
-            return `[-] Removed: ${JSON.stringify(change.before)}`;
+            return `[-] Removed${ctx}: ${JSON.stringify(change.before)}`;
         case "modified":
-            return `[~] Changed: ${JSON.stringify(change.before)} → ${JSON.stringify(change.after)}`;
+            return `[~] Changed${ctx}: ${JSON.stringify(change.before)} → ${JSON.stringify(change.after)}`;
         default:
             return "[=] Unchanged";
     }
@@ -187,6 +226,28 @@ export function reportAsDict(report: DiffReport): Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
+// Watcher status
+// ---------------------------------------------------------------------------
+
+export interface WatcherStatus {
+    url: string;
+    label: string;
+    target: string | undefined;
+    interval: number;
+    paused: boolean;
+    /** Timestamp of the last completed check (null = never checked). */
+    lastCheckAt: Date | null;
+    /** Estimated timestamp of the next scheduled check. */
+    nextCheckAt: Date | null;
+    /** Timestamp of the last detected change (null = no change seen yet). */
+    lastChangeAt: Date | null;
+    /** Total number of checks performed since start. */
+    checksCount: number;
+    /** Total number of checks that produced at least one change. */
+    changesCount: number;
+}
+
+// ---------------------------------------------------------------------------
 // Store contract
 // ---------------------------------------------------------------------------
 
@@ -198,4 +259,6 @@ export interface IStore {
     clearHistory(url: string, target: string | undefined): void;
     saveReport(report: DiffReport): void;
     loadReports(url: string, target: string | undefined, limit?: number): Record<string, unknown>[];
+    /** Optional: prune oldest snapshots, keeping only the last `max` entries. */
+    pruneSnapshots?(url: string, target: string | undefined, max: number): void;
 }

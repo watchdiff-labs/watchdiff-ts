@@ -3,7 +3,12 @@
  *
  * Supported channels:
  *   - JS callbacks (sync or async)
- *   - Webhooks: Discord, Slack, generic HTTP POST
+ *   - Discord webhook
+ *   - Slack webhook
+ *   - Telegram Bot API  (https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<CHAT_ID>)
+ *   - Microsoft Teams   (https://outlook.office.com/webhook/...)
+ *   - ntfy.sh           (https://ntfy.sh/<topic>)
+ *   - Generic HTTP POST
  */
 
 import {
@@ -34,13 +39,13 @@ export class Notifier {
     }
 
     private async sendWebhook(url: string, report: DiffReport): Promise<void> {
-        const payload = this.buildPayload(url, report);
+        const { payload, headers } = this.buildPayload(url, report);
         try {
             const res = await globalThis.fetch(url, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload),
-                signal: AbortSignal.timeout(10_000),
+                method:  "POST",
+                headers: { "Content-Type": "application/json", ...headers },
+                body:    JSON.stringify(payload),
+                signal:  AbortSignal.timeout(10_000),
             });
             if (!res.ok) {
                 console.warn(`[watchdiff] Webhook ${url} returned ${res.status}`);
@@ -50,20 +55,68 @@ export class Notifier {
         }
     }
 
-    private buildPayload(url: string, report: DiffReport): Record<string, unknown> {
-        const summary       = reportSummary(report);
-        const changeLines   = report.changes
+    private buildPayload(
+        url: string,
+        report: DiffReport
+    ): { payload: Record<string, unknown>; headers: Record<string, string> } {
+        const summary     = reportSummary(report);
+        const changeLines = report.changes
             .slice(0, 20)
             .map(changeHuman)
             .join("\n");
         const text = `${summary}\n\n${changeLines}`;
 
+        // Discord
         if (url.includes("discord.com")) {
-            return { content: text.slice(0, 2000) };
+            return { payload: { content: text.slice(0, 2000) }, headers: {} };
         }
+
+        // Slack
         if (url.includes("hooks.slack.com")) {
-            return { text: text.slice(0, 3000) };
+            return { payload: { text: text.slice(0, 3000) }, headers: {} };
         }
-        return reportAsDict(report);
+
+        // Telegram  - URL format: https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>
+        if (url.includes("api.telegram.org")) {
+            const chatId = new URL(url).searchParams.get("chat_id") ?? "";
+            return {
+                payload: {
+                    chat_id:    chatId,
+                    text:       text.slice(0, 4096),
+                    parse_mode: "HTML",
+                },
+                headers: {},
+            };
+        }
+
+        // Microsoft Teams (Incoming Webhook or Power Automate)
+        if (url.includes("outlook.office.com") || url.includes("webhook.office.com") || url.includes("logic.azure.com")) {
+            return {
+                payload: {
+                    "@type":      "MessageCard",
+                    "@context":   "http://schema.org/extensions",
+                    summary:      summary,
+                    themeColor:   "FF8C00",
+                    title:        summary,
+                    text:         `<pre>${changeLines.slice(0, 3000)}</pre>`,
+                },
+                headers: {},
+            };
+        }
+
+        // ntfy.sh  - URL format: https://ntfy.sh/<topic>
+        if (url.includes("ntfy.sh") || url.includes("ntfy.")) {
+            return {
+                payload: { message: text.slice(0, 4096) },
+                headers: {
+                    Title:    summary.slice(0, 255),
+                    Priority: "default",
+                    Tags:     "rotating_light",
+                },
+            };
+        }
+
+        // Generic
+        return { payload: reportAsDict(report), headers: {} };
     }
 }

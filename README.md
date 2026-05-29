@@ -10,11 +10,19 @@ No noisy HTML diffs. No external services. No AI black boxes.
 - **CSS selectors AND XPath** - target any zone of any page
 - **JS-heavy pages** - optional Playwright headless browser rendering
 - **Proxy and User-Agent rotation** - avoid rate-limiting
-- **Semantic diff** - paragraph-level granularity, not just line-by-line
+- **4 diff modes** - line, word, semantic, JSON
 - **SQLite backend** - optional, for high-volume workloads
 - **CSV / XLSX export** - full history export in one command
 - **Zero external services** - snapshots stored locally as JSON or SQLite
 - **Alert cooldown** - minimum delay between two alerts per URL to prevent notification spam
+- **Retry with backoff** - automatic retry on fetch errors with exponential backoff
+- **5 webhook channels** - Discord, Slack, Telegram, Microsoft Teams, ntfy.sh
+- **Pause / Resume** - dynamically suspend and restart individual watchers
+- **Silence detection** - alert when a page stops changing
+- **Dry-run mode** - fetch and diff without saving or alerting
+- **Snapshot pruning** - keep only the last N snapshots per URL
+- **Change threshold** - require a minimum fraction of content to change before alerting
+- **ignoreNumbers** - strip standalone numbers to ignore counter/date noise
 - **Fully typed** - complete TypeScript types included
 - **Native fetch** - no HTTP library dependency, runs on Node.js 18+
 
@@ -28,12 +36,26 @@ No noisy HTML diffs. No external services. No AI black boxes.
 | Get notified on change | `onChange: (report) => ...` or `webhooks: ["https://discord.com/..."]` |
 | Render JS-heavy pages | `browser: true` (requires playwright) |
 | Avoid notification spam | `cooldown: 3600` (min seconds between alerts) |
+| Retry on fetch errors | `retries: 3, retryDelay: 1000` (exponential backoff) |
+| Randomise polling interval | `jitter: 0.2` (±20% variance) |
+| Word-level diff | `diffMode: "word"` |
+| Diff a JSON API endpoint | `diffMode: "json"` |
 | Rotate proxies / UAs | `proxies: [...]`, `userAgents: [...]` |
 | Diff at paragraph level | `diffMode: "semantic"` |
 | Persist to SQLite | `new WatchDiff(undefined, new SqliteStore(".db"))` |
 | Export history | `.exportReportsCsv(url)` / `.exportReportsXlsx(url)` |
+| Pause a watcher | `wd.pause(url)` / `wd.resume(url)` |
+| Check watcher state | `wd.status()` |
+| Alert on page silence | `alertIfNoChangeAfter: 86400` |
+| Dry-run (no save/alert) | `dryRun: true` |
+| Limit snapshot storage | `maxSnapshots: 100` |
+| Ignore counters / dates | `ignoreNumbers: true` |
+| Require significant change | `changeThreshold: 0.05` (5% of content) |
+| Handle errors gracefully | `onError: (err) => myLogger.error(err)` |
 | CLI one-liner | `watchdiff run https://example.com --target .price --interval 60` |
 | Multi-URL config file | `watchdiff init` then edit `watchdiff.config.json` |
+| Show watcher status | `watchdiff status` |
+| Show last diff | `watchdiff diff https://example.com` |
 
 ### Quick navigation
 
@@ -46,15 +68,25 @@ No noisy HTML diffs. No external services. No AI black boxes.
   - [Proxy rotation](#proxy-rotation)
   - [User-Agent rotation](#user-agent-rotation)
   - [XPath selectors](#xpath-selectors)
-  - [Semantic diff mode](#semantic-diff-mode)
+  - [Diff modes](#diff-modes)
   - [Alert cooldown](#alert-cooldown)
+  - [Retry with exponential backoff](#retry-with-exponential-backoff)
+  - [Interval jitter](#interval-jitter)
+  - [Pause and resume](#pause-and-resume)
+  - [Watcher status](#watcher-status)
+  - [Silence detection](#silence-detection)
+  - [Dry-run mode](#dry-run-mode)
+  - [Snapshot pruning](#snapshot-pruning)
+  - [Change threshold](#change-threshold)
+  - [Ignore numbers](#ignore-numbers)
+  - [Error callback](#error-callback)
+  - [Webhook channels](#webhook-channels)
   - [SQLite storage backend](#sqlite-storage-backend)
   - [CSV and XLSX export](#csv-and-xlsx-export)
   - [Config file](#watchdiff-init---config-file)
 - [Types](#types)
 - [Helper functions](#helper-functions)
 - [CLI reference](#cli)
-- [Webhooks](#webhooks)
 - [Advanced usage](#advanced-usage)
 - [Optional dependencies](#optional-dependencies)
 
@@ -105,11 +137,11 @@ Every check runs through a fixed pipeline:
 Fetcher / BrowserFetcher -> Cleaner -> Parser -> DiffEngine -> Store -> Notifier
 ```
 
-1. **Fetcher** - downloads the page via native `fetch` (Node 18+), with proxy and UA rotation
+1. **Fetcher** - downloads the page via native `fetch` (Node 18+), with proxy and UA rotation, and optional retry
 2. **BrowserFetcher** - optional Playwright path for JS-rendered pages
 3. **Cleaner** - strips scripts, styles, ads, and tracking noise (cheerio)
 4. **Parser** - extracts the target CSS selector or XPath expression (or full body)
-5. **DiffEngine** - compares content in line mode or semantic block mode
+5. **DiffEngine** - compares content in line, word, semantic, or JSON mode
 6. **Store** - persists snapshots and reports as JSON files or SQLite
 7. **Notifier** - fires callbacks and webhooks on detected changes
 
@@ -144,11 +176,21 @@ Register a URL to monitor.
 | `browserOptions` | `BrowserOptions` | - | Options for the headless browser |
 | `proxies` | `string[]` | `[]` | Proxy URLs to rotate through |
 | `userAgents` | `string[]` | `[]` | User-Agent strings to rotate through |
-| `diffMode` | `"line" \| "semantic"` | `"line"` | Diff granularity |
+| `diffMode` | `"line" \| "semantic" \| "word" \| "json"` | `"line"` | Diff granularity |
 | `onChange` | `fn \| fn[]` | - | Callback(s) receiving a `DiffReport` on each change |
-| `webhooks` | `string[]` | `[]` | Discord / Slack / custom POST endpoints |
+| `webhooks` | `string[]` | `[]` | Discord / Slack / Telegram / Teams / ntfy.sh / custom POST |
 | `minChanges` | `number` | `1` | Minimum changes required to trigger an alert |
 | `cooldown` | `number` | `0` | Minimum seconds between two consecutive alerts (anti-spam) |
+| `retries` | `number` | `0` | Fetch retry count on error (exponential backoff) |
+| `retryDelay` | `number` | `1000` | Base delay in ms before first retry (doubles each attempt) |
+| `jitter` | `number` | `0` | Interval randomisation factor 0-1. `0.2` = ±20% variance |
+| `dryRun` | `boolean` | `false` | Fetch and diff without saving or alerting |
+| `maxSnapshots` | `number` | - | Keep only the last N snapshots per URL |
+| `changeThreshold` | `number` | `0` | Minimum fraction 0-1 of content that must change before alerting |
+| `ignoreNumbers` | `boolean` | `false` | Strip standalone numbers before diffing |
+| `alertIfNoChangeAfter` | `number` | - | Fire `onSilence` after this many seconds without a detected change |
+| `onError` | `fn` | - | Called on fetch/parse errors instead of logging to console |
+| `onSilence` | `fn` | - | Called when `alertIfNoChangeAfter` seconds elapse without a change |
 
 ```typescript
 wd
@@ -157,6 +199,8 @@ wd
     interval: 30,
     onChange: (report) => console.log(report.changes),
     webhooks: ["https://discord.com/api/webhooks/YOUR_WEBHOOK"],
+    retries: 3,
+    cooldown: 3600,
   })
   .watch("https://news.ycombinator.com", { interval: 300, label: "HN" });
 ```
@@ -197,6 +241,50 @@ Single immediate check without starting the scheduler.
 wd.watch("https://example.com", { target: ".price" });
 const report = await wd.checkOnce("https://example.com");
 if (report) console.log(reportSummary(report));
+```
+
+
+### `.pause(url)` / `.resume(url)`
+
+Suspend or resume a watcher at runtime without stopping the scheduler.
+
+```typescript
+const stop = wd.start();
+
+// Pause during maintenance window
+wd.pause("https://example.com");
+
+// Resume later
+setTimeout(() => wd.resume("https://example.com"), 30_000);
+```
+
+
+### `.status()`
+
+Return runtime status for all registered watchers.
+
+```typescript
+const statuses = wd.status();
+for (const s of statuses) {
+  console.log(s.url, s.paused, s.checksCount, s.lastChangeAt);
+}
+```
+
+Returns an array of `WatcherStatus`:
+
+```typescript
+interface WatcherStatus {
+  url:          string;
+  label:        string;
+  target:       string | undefined;
+  interval:     number;
+  paused:       boolean;
+  lastCheckAt:  Date | null;
+  nextCheckAt:  Date | null;
+  lastChangeAt: Date | null;
+  checksCount:  number;
+  changesCount: number;
+}
 ```
 
 
@@ -247,15 +335,12 @@ npx playwright install chromium
 wd.watch("https://spa-example.com", {
   browser: true,
   browserOptions: {
-    waitFor: "networkidle",     // wait until network is quiet
+    waitFor: "networkidle",      // wait until network is quiet
     waitForSelector: ".content", // also wait for this CSS selector
   },
   interval: 120,
 });
 ```
-
-The headless browser also supports proxy and User-Agent rotation, and respects the
-`config.headers` as extra HTTP headers.
 
 
 ### Proxy rotation
@@ -274,9 +359,6 @@ wd.watch("https://example.com", {
 });
 ```
 
-Proxy support for native `fetch` uses [undici](https://undici.nodejs.org/) (bundled with
-Node.js). For the headless browser path, Playwright handles the proxy natively.
-
 
 ### User-Agent rotation
 
@@ -292,9 +374,6 @@ wd.watch("https://example.com", {
   interval: 30,
 });
 ```
-
-When `userAgents` is omitted, WatchDiff rotates through its own pool of modern browser
-User-Agents automatically.
 
 
 ### XPath selectors
@@ -316,38 +395,71 @@ wd.watch("https://example.com", {
   target: "//table[@id='results']//tr[position()>1]/td[2]",
   label:  "Table column 2",
 });
-
-// XPath also works in the CLI
-// watchdiff run https://example.com --target "//h1[@class='title']"
 ```
 
-XPath is evaluated using [xpath](https://www.npmjs.com/package/xpath) and
-[@xmldom/xmldom](https://www.npmjs.com/package/@xmldom/xmldom).
 
+### Diff modes
 
-### Semantic diff mode
+WatchDiff supports four diff modes selectable via `diffMode`:
 
-By default, WatchDiff diffs content line by line. In `semantic` mode it instead extracts
-meaningful content blocks from the page's HTML - paragraphs, headings, list items, table
-cells - and diffs those blocks. This gives much better signal for structured pages:
+| Mode | Best for | Granularity |
+|---|---|---|
+| `"line"` (default) | General text content | Line by line |
+| `"semantic"` | Blog posts, news articles, structured pages | Paragraph / heading / cell |
+| `"word"` | Short values, prices, status text | Word by word |
+| `"json"` | REST APIs, JSON feeds | Nested key path |
+
+**`line` mode (default)**
+
+Myers line-by-line diff. Each change = one line of text.
+
+**`word` mode**
+
+Word-level diff, useful for tracking individual value changes in dense text. Changes are
+smaller and more precise than line mode.
 
 ```typescript
-// Each "change" is now a paragraph or heading, not a random text fragment
+wd.watch("https://example.com/status", {
+  target:   ".status-text",
+  diffMode: "word",
+});
+// change: [~] Changed: "operational" → "degraded"
+```
+
+**`semantic` mode**
+
+Extracts semantic content blocks (`<p>`, `<h1-h6>`, `<li>`, `<td>`, `<th>`, `<blockquote>`)
+and diffs those blocks. Each change = one paragraph or heading - no fragmented line splits.
+
+```typescript
 wd.watch("https://blog.example.com/post/123", {
   diffMode: "semantic",
   label:    "Blog post",
 });
 ```
 
-Semantic mode extracts:
-- `<p>` - paragraphs
-- `<h1>` through `<h6>` - headings
-- `<li>` - list items
-- `<td>` and `<th>` - table cells
-- `<blockquote>` - quotes
+**`json` mode**
 
-When the HTML contains no block-level elements (e.g. a plain-text response), it falls
-back to line-level diff automatically.
+Designed for JSON API endpoints. Recursively walks the JSON structure and reports changes by
+key path, making it easy to track which specific field changed.
+
+```typescript
+wd.watch("https://api.example.com/product/42", {
+  diffMode: "json",
+  headers:  { Accept: "application/json" },
+  label:    "Product API",
+  onChange: (report) => {
+    for (const c of report.changes) {
+      // c.context = "price", "stock.available", etc.
+      console.log(changeHuman(c));
+    }
+  },
+});
+// [~] Changed (price): "19.99" → "24.99"
+// [~] Changed (stock.available): "true" → "false"
+```
+
+Falls back to line diff automatically when the content cannot be parsed as JSON.
 
 
 ### Alert cooldown
@@ -359,28 +471,242 @@ notification storms when a page changes on every check (e.g. live counters, time
 wd.watch("https://example.com/live-stats", {
   target:   ".visitor-count",
   interval: 30,
-  cooldown: 3600,  // at most one alert per hour, even if content changes every 30s
+  cooldown: 3600,  // at most one alert per hour
   onChange: (report) => sendNotification(report),
 });
 ```
 
 When a change is detected but the cooldown has not elapsed, the change is still stored
-in the snapshot history and the diff report is saved - only the alert (callbacks +
-webhooks) is suppressed. A debug log line is printed with the remaining time.
+in the snapshot history - only the alert (callbacks + webhooks) is suppressed.
 
 ```bash
-# CLI: suppress alerts for 10 minutes minimum
 watchdiff run https://example.com --target .price --cooldown 600
 ```
 
-In a config file:
 
-```json
-{
-  "url": "https://example.com",
-  "interval": 60,
-  "cooldown": 1800
+### Retry with exponential backoff
+
+Configure automatic retries on fetch errors (network failures, 5xx, timeouts).
+WatchDiff waits `retryDelay * 2^(attempt-1)` ms between attempts.
+
+```typescript
+wd.watch("https://example.com", {
+  retries:    3,      // up to 3 extra attempts (4 total)
+  retryDelay: 2000,   // 2s → 4s → 8s between attempts
+});
+```
+
+- `retries: 0` (default) - no retry, fail immediately
+- 4xx errors (except 429) are not retried - only network errors, timeouts, 5xx, and 429
+- The `onError` callback is invoked after all retries are exhausted
+
+
+### Interval jitter
+
+Add randomness to the polling interval to avoid predictable bot patterns or thundering
+herds when monitoring many URLs with the same interval.
+
+```typescript
+wd.watch("https://example.com", {
+  interval: 300,
+  jitter:   0.2,  // actual interval: 240-360s (300 ± 20%)
+});
+```
+
+`jitter` is a fraction 0-1. `0.2` means ±20% variance around `interval`.
+
+
+### Pause and resume
+
+Suspend a watcher temporarily without stopping the entire scheduler. Useful for maintenance
+windows, rate-limit back-off, or feature flags.
+
+```typescript
+const stop = wd
+  .watch("https://example.com")
+  .start();
+
+// Pause during nightly maintenance
+const MAINTENANCE_HOUR = 3;
+setInterval(() => {
+  const hour = new Date().getHours();
+  if (hour === MAINTENANCE_HOUR) {
+    wd.pause("https://example.com");
+  } else {
+    wd.resume("https://example.com");
+  }
+}, 60_000);
+```
+
+Pausing is per-URL. Other watchers continue unaffected.
+
+
+### Watcher status
+
+Get a live snapshot of the state of all registered watchers - useful for dashboards,
+health checks, or diagnostics.
+
+```typescript
+const statuses = wd.status();
+for (const s of statuses) {
+  console.log(`${s.label}: ${s.checksCount} checks, ${s.changesCount} changes, paused=${s.paused}`);
 }
+```
+
+From the CLI:
+
+```bash
+watchdiff status                       # reads watchdiff.config.json
+watchdiff status --config my.json
+watchdiff status --json                # machine-readable output
+```
+
+
+### Silence detection
+
+Fire a callback when a page has not changed for longer than expected. Useful to detect
+pages that have gone offline or stale without any content change being emitted.
+
+```typescript
+wd.watch("https://example.com/feed", {
+  interval:             300,
+  alertIfNoChangeAfter: 86400,  // 24 hours
+  onSilence: ({ url, label, secondsSinceLastChange }) => {
+    console.warn(`${label} has not changed in ${secondsSinceLastChange}s`);
+    sendAlert(`${label} may be offline or broken`);
+  },
+});
+```
+
+The silence callback fires at most once per `alertIfNoChangeAfter` seconds to avoid repeated
+alerts. The timer resets on the next detected change.
+
+
+### Dry-run mode
+
+Fetch and diff pages without writing any data to disk or firing any alerts. Useful
+for testing your config or verifying selectors before going live.
+
+```typescript
+wd.watch("https://example.com", {
+  target: ".price",
+  dryRun: true,
+  onChange: (report) => console.log("Would have alerted:", reportSummary(report)),
+});
+```
+
+```bash
+watchdiff run https://example.com --target .price --dry-run
+watchdiff check https://example.com --dry-run
+```
+
+In dry-run mode: snapshots are not saved, reports are not saved, no callbacks or webhooks
+are fired. The `onChange` callback is still invoked if provided - letting you inspect what
+*would* have been alerted.
+
+
+### Snapshot pruning
+
+Limit disk usage by keeping only the most recent N snapshots per URL. Older snapshots
+are deleted automatically after each save.
+
+```typescript
+wd.watch("https://example.com", {
+  maxSnapshots: 50,  // keep last 50 snapshots
+});
+```
+
+Works with both the JSON store and SqliteStore. Does not affect reports.
+
+
+### Change threshold
+
+Require a minimum fraction of content to have changed before firing an alert. Useful for
+pages that have minor noise (timestamps, ad counters) but you only care about substantial
+changes.
+
+```typescript
+wd.watch("https://example.com/article", {
+  changeThreshold: 0.05,  // only alert if at least 5% of content changed
+});
+```
+
+`changeThreshold` is a fraction from `0` (any change, default) to `1` (entire content
+must change). Changes below the threshold are still stored, just not alerted.
+
+
+### Ignore numbers
+
+Strip standalone numbers from the text before diffing. Useful when a page contains
+rotating counters, view counts, timestamps, or prices you don't care about.
+
+```typescript
+wd.watch("https://example.com/live", {
+  ignoreNumbers: true,  // "1,234 views updated at 14:52" → no change detected
+});
+```
+
+```bash
+watchdiff run https://example.com --ignore-numbers
+```
+
+
+### Error callback
+
+Instead of logging fetch and parse errors to the console, handle them in your own code:
+
+```typescript
+wd.watch("https://example.com", {
+  retries:  2,
+  onError: (err, config) => {
+    myLogger.error({ url: config.url, message: err.message });
+    metrics.increment("watchdiff.errors");
+  },
+});
+```
+
+The callback receives the `Error` object and the full `WatchConfig` for the failing URL.
+
+
+### Webhook channels
+
+Payload format is auto-detected from the URL. All webhooks time out after 10 seconds and
+never block each other (`Promise.allSettled`).
+
+| URL pattern | Channel | Payload |
+|---|---|---|
+| `discord.com` | Discord | `{ content: "..." }` (≤ 2000 chars) |
+| `hooks.slack.com` | Slack | `{ text: "..." }` (≤ 3000 chars) |
+| `api.telegram.org` | Telegram Bot API | `{ chat_id, text, parse_mode: "HTML" }` |
+| `outlook.office.com` / `webhook.office.com` | Microsoft Teams | MessageCard JSON |
+| `ntfy.sh` / `ntfy.` | ntfy.sh | `{ message }` with Title and Tags headers |
+| anything else | Generic | Full `DiffReport` as JSON |
+
+**Telegram** - format the URL as:
+```
+https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<CHAT_ID>
+```
+
+```typescript
+wd.watch("https://example.com", {
+  webhooks: [
+    "https://api.telegram.org/botABC123/sendMessage?chat_id=-1001234567",
+  ],
+});
+```
+
+**ntfy.sh** - self-hosted or public push notifications:
+```typescript
+wd.watch("https://example.com", {
+  webhooks: ["https://ntfy.sh/my-topic"],
+});
+```
+
+**Microsoft Teams** - use an Incoming Webhook connector URL:
+```typescript
+wd.watch("https://example.com", {
+  webhooks: ["https://outlook.office.com/webhook/YOUR/IncomingWebhook/TOKEN"],
+});
 ```
 
 
@@ -403,9 +729,8 @@ wd.watch("https://example.com", { interval: 60 });
 wd.start();
 ```
 
-`SqliteStore` implements the same `IStore` interface as the default `Store`, so it is
-a drop-in replacement. Both `snapshots` and `reports` are stored in a single `.db` file
-with indexed queries.
+`SqliteStore` implements the same `IStore` interface as the default `Store` and also
+implements `pruneSnapshots` for `maxSnapshots` support.
 
 
 ### CSV and XLSX export
@@ -452,7 +777,7 @@ Generate a `watchdiff.config.json` template in the current directory:
 watchdiff init
 ```
 
-The generated file:
+The generated file now includes all supported options:
 
 ```json
 {
@@ -466,6 +791,13 @@ The generated file:
       "browser": false,
       "diffMode": "line",
       "cooldown": 0,
+      "retries": 0,
+      "jitter": 0,
+      "dryRun": false,
+      "maxSnapshots": 100,
+      "changeThreshold": 0,
+      "ignoreNumbers": false,
+      "alertIfNoChangeAfter": 0,
       "webhooks": [],
       "ignoreSelectors": [],
       "proxies": [],
@@ -473,16 +805,6 @@ The generated file:
     }
   ]
 }
-```
-
-Run from config:
-
-```bash
-# Explicit
-watchdiff run --config watchdiff.config.json
-
-# Auto-discover (looks for watchdiff.config.json in cwd)
-watchdiff run
 ```
 
 
@@ -509,7 +831,7 @@ interface Change {
   kind:     "added" | "removed" | "modified" | "unchanged";
   before?:  string;
   after?:   string;
-  context?: string;
+  context?: string;  // JSON key path in "json" mode, surrounding hint otherwise
 }
 ```
 
@@ -523,6 +845,33 @@ interface Snapshot {
   rawHtml:     string;   // raw HTML of the extracted zone
   capturedAt:  Date;
   checksum:    string;   // SHA-256 of content
+}
+```
+
+### `WatcherStatus`
+
+```typescript
+interface WatcherStatus {
+  url:          string;
+  label:        string;
+  target:       string | undefined;
+  interval:     number;
+  paused:       boolean;
+  lastCheckAt:  Date | null;
+  nextCheckAt:  Date | null;
+  lastChangeAt: Date | null;
+  checksCount:  number;
+  changesCount: number;
+}
+```
+
+### `SilenceInfo`
+
+```typescript
+interface SilenceInfo {
+  url:                    string;
+  label:                  string;
+  secondsSinceLastChange: number;
 }
 ```
 
@@ -546,6 +895,7 @@ interface IStore {
   clearHistory(url: string, target: string | undefined): void;
   saveReport(report: DiffReport): void;
   loadReports(url: string, target: string | undefined, limit?: number): Record<string, unknown>[];
+  pruneSnapshots?(url: string, target: string | undefined, max: number): void; // optional
 }
 ```
 
@@ -558,7 +908,7 @@ import { reportSummary, reportHasChanges, reportAsDict, changeHuman } from "watc
 reportSummary(report);     // "[Book price] 1 modified - 2025-01-01 12:00:00 UTC"
 reportHasChanges(report);  // boolean
 reportAsDict(report);      // JSON-serialisable plain object
-changeHuman(change);       // "[~] Changed: '19' -> '24'"
+changeHuman(change);       // "[~] Changed (price): '19.99' → '24.99'"
 ```
 
 
@@ -583,11 +933,41 @@ watchdiff run https://example.com --proxy http://proxy:8080
 # Custom User-Agent
 watchdiff run https://example.com --user-agent "MyBot/1.0"
 
-# Semantic diff
-watchdiff run https://example.com --diff-mode semantic
+# Word diff
+watchdiff run https://example.com --diff-mode word
 
-# With a Discord or Slack webhook
+# JSON diff
+watchdiff run https://api.example.com/data --diff-mode json
+
+# With a Discord / Slack / Telegram / ntfy.sh webhook
 watchdiff run https://example.com --target .price --webhook https://discord.com/api/webhooks/ID/TOKEN
+
+# Retry 3 times on error
+watchdiff run https://example.com --retries 3
+
+# Add ±20% jitter to interval
+watchdiff run https://example.com --interval 300 --jitter 0.2
+
+# Dry-run (no save, no alerts)
+watchdiff run https://example.com --dry-run
+
+# Keep only last 50 snapshots
+watchdiff run https://example.com --max-snapshots 50
+
+# Only alert if 5% or more of content changed
+watchdiff run https://example.com --change-threshold 0.05
+
+# Ignore counter / date noise
+watchdiff run https://example.com --ignore-numbers
+
+# Silence alert after 24h without change
+watchdiff run https://example.com --alert-if-no-change 86400
+
+# Suppress all output except errors
+watchdiff run https://example.com -q
+
+# Show debug ticks and cooldown skips
+watchdiff run https://example.com -v
 
 # From a config file
 watchdiff run --config watchdiff.config.json
@@ -601,7 +981,28 @@ watchdiff run
 ```bash
 watchdiff check https://example.com --target .price
 watchdiff check https://example.com --browser --diff-mode semantic
+watchdiff check https://example.com --dry-run
 watchdiff check https://example.com --json
+```
+
+### `status` - watcher status
+
+Show runtime state for all watchers defined in a config file:
+
+```bash
+watchdiff status
+watchdiff status --config my.json
+watchdiff status --json
+```
+
+### `diff` - last stored diff
+
+Show the most recent diff report for a URL without fetching the page again:
+
+```bash
+watchdiff diff https://example.com
+watchdiff diff https://example.com --target .price
+watchdiff diff https://example.com --json
 ```
 
 ### `history` - snapshot history
@@ -633,9 +1034,6 @@ watchdiff export https://example.com --format xlsx --output reports.xlsx
 
 # Limit the number of exported entries
 watchdiff export https://example.com --limit 500 --output reports.csv
-
-# With a CSS or XPath target
-watchdiff export https://example.com --target .price --output price-history.csv
 ```
 
 ### `init` - generate config file
@@ -653,19 +1051,6 @@ watchdiff clear https://example.com --yes   # skip confirmation
 ```
 
 
-## Webhooks
-
-Payload format is auto-detected from the URL:
-
-| URL contains | Payload |
-|---|---|
-| `discord.com` | `{ content: "..." }` (capped at 2000 chars) |
-| `hooks.slack.com` | `{ text: "..." }` (capped at 3000 chars) |
-| anything else | full `DiffReport` as JSON |
-
-Timeout: 10 seconds per webhook. A failed webhook never blocks others (`Promise.allSettled`).
-
-
 ## Advanced usage
 
 ### Use individual pipeline stages
@@ -679,7 +1064,11 @@ import {
   makeWatchConfig, reportSummary, isXPath,
 } from "watchdiff-core";
 
-const config   = makeWatchConfig("https://example.com", { target: ".price", diffMode: "semantic" });
+const config   = makeWatchConfig("https://example.com", {
+  target: ".price",
+  diffMode: "semantic",
+  retries: 2,
+});
 const fetcher  = config.browser ? new BrowserFetcher() : new Fetcher();
 const html     = await fetcher.fetch(config);
 const $        = new Cleaner().clean(html);
@@ -704,11 +1093,13 @@ import { WatchDiff } from "watchdiff-core";
 
 class RedisStore implements IStore {
   saveSnapshot(snap: Snapshot) { /* ... */ }
-  loadLatest(url: string, target: string | undefined) { /* ... */ return null; }
+  loadLatest(url: string, target: string | undefined) { return null; }
   loadHistory(url: string, target: string | undefined, limit?: number) { return []; }
   clearHistory(url: string, target: string | undefined) { /* ... */ }
   saveReport(report: DiffReport) { /* ... */ }
   loadReports(url: string, target: string | undefined, limit?: number) { return []; }
+  // Optional - implement for maxSnapshots support
+  pruneSnapshots(url: string, target: string | undefined, max: number) { /* ... */ }
 }
 
 const wd = new WatchDiff(undefined, new RedisStore());
@@ -735,6 +1126,37 @@ wd.watch("https://rss.example.com/feed.xml", {
 });
 ```
 
+### Production-ready config
+
+```typescript
+const wd = new WatchDiff(undefined, new SqliteStore(".watchdiff.db"));
+
+wd.watch("https://shop.example.com/product/42", {
+  target:               ".price",
+  label:                "Product 42 price",
+  interval:             120,
+  jitter:               0.15,
+  retries:              3,
+  retryDelay:           2000,
+  cooldown:             1800,
+  maxSnapshots:         200,
+  changeThreshold:      0.01,
+  diffMode:             "word",
+  alertIfNoChangeAfter: 604800,  // 1 week silence = page may be broken
+  webhooks: [
+    "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK",
+    "https://ntfy.sh/my-price-monitor",
+  ],
+  onError: (err, config) => logger.error({ url: config.url, err: err.message }),
+  onSilence: ({ label, secondsSinceLastChange }) => {
+    logger.warn(`${label} has not changed in ${Math.floor(secondsSinceLastChange / 86400)} days`);
+  },
+});
+
+wd.start();
+```
+
+
 ## Optional dependencies
 
 | Feature | Package to install |
@@ -749,7 +1171,7 @@ wd.watch("https://rss.example.com/feed.xml", {
 ```bash
 npm install
 npm run build     # compile TypeScript to dist/
-npm test          # vitest (17 tests)
+npm test          # vitest
 npm run typecheck # tsc --noEmit
 ```
 
@@ -769,4 +1191,3 @@ If you want a feature that is not yet in the project, open an issue or submit a 
 This project is licensed under the [GNU General Public License v3.0](LICENSE).
 
 You are free to use, study, modify, and distribute this software under the terms of the GPL v3.
-Any derivative work must also be distributed under the same license.

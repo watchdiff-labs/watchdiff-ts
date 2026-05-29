@@ -3,6 +3,7 @@
  *
  * Supports proxy rotation and User-Agent rotation via WatchConfig.
  * When proxies are provided, uses undici ProxyAgent for per-request proxy selection.
+ * Automatic retry with exponential backoff via `retries` and `retryDelay` options.
  */
 
 import type { WatchConfig } from "../models.js";
@@ -33,6 +34,30 @@ export class FetchError extends Error {
 
 export class Fetcher {
     async fetch(config: WatchConfig): Promise<string> {
+        const maxAttempts   = 1 + (config.retries ?? 0);
+        const baseDelay     = config.retryDelay ?? 1_000;
+        let lastErr: FetchError | undefined;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                return await this.attemptFetch(config);
+            } catch (err) {
+                lastErr = err instanceof FetchError ? err : new FetchError(String(err));
+
+                const isLast    = attempt === maxAttempts;
+                const retryable = !lastErr.statusCode || lastErr.statusCode >= 500 || lastErr.statusCode === 429;
+
+                if (isLast || !retryable) throw lastErr;
+
+                const delay = baseDelay * Math.pow(2, attempt - 1);
+                await sleep(delay);
+            }
+        }
+
+        throw lastErr!;
+    }
+
+    private async attemptFetch(config: WatchConfig): Promise<string> {
         const userAgent  = pickRandom(config.userAgents ?? []) ?? pickRandom([...DEFAULT_USER_AGENTS]) ?? FALLBACK_UA;
         const headers    = { ...BASE_HEADERS, "User-Agent": userAgent, ...config.headers };
         const controller = new AbortController();
@@ -104,4 +129,8 @@ function pickRandom<T>(pool: readonly T[]): T | undefined {
     if (pool.length === 0) return undefined;
     const idx = Math.floor(Math.random() * pool.length);
     return pool[idx];
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }

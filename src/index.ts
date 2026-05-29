@@ -33,6 +33,8 @@ export type {
     Snapshot,
     Change,
     DiffReport,
+    SilenceInfo,
+    WatcherStatus,
 } from "./models.js";
 
 export { Fetcher, FetchError } from "./fetcher/index.js";

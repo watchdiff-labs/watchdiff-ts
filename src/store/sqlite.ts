@@ -139,6 +139,18 @@ export class SqliteStore implements IStore {
         `).run(url, target ?? null);
     }
 
+    pruneSnapshots(url: string, target: string | undefined, max: number): void {
+        this.db.prepare(`
+            DELETE FROM snapshots
+            WHERE url = ? AND target IS ?
+              AND id NOT IN (
+                SELECT id FROM snapshots
+                WHERE url = ? AND target IS ?
+                ORDER BY id DESC LIMIT ?
+              )
+        `).run(url, target ?? null, url, target ?? null, max);
+    }
+
     // ------------------------------------------------------------------
     // Reports
     // ------------------------------------------------------------------

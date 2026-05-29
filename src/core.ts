@@ -18,8 +18,10 @@ import {
     type DiffMode,
     type DiffReport,
     type IStore,
+    type SilenceInfo,
     type Snapshot,
     type WatchConfig,
+    type WatcherStatus,
 } from "./models.js";
 import { Scheduler } from "./scheduler/index.js";
 import { Store } from "./store/index.js";
@@ -48,24 +50,44 @@ export interface WatchOptions {
     proxies?: string[];
     /** List of User-Agent strings to rotate through. */
     userAgents?: string[];
-    /** Diff granularity: "line" (default) or "semantic" (paragraph/table/list blocks). */
+    /** Diff granularity: "line" (default), "semantic", "word", or "json". */
     diffMode?: DiffMode;
     /** Callback(s) invoked with a DiffReport on each change. */
     onChange?: ((report: DiffReport) => void | Promise<void>) | Array<(report: DiffReport) => void | Promise<void>>;
-    /** Webhook URLs (Discord / Slack / custom). */
+    /** Webhook URLs (Discord / Slack / Telegram / Teams / ntfy.sh / custom). */
     webhooks?: string[];
     /** Minimum changes required to trigger an alert. */
     minChanges?: number;
     /** Minimum seconds between two consecutive alerts for this URL (anti-spam). */
     cooldown?: number;
+    /** Number of fetch retries on error before giving up (default 0). */
+    retries?: number;
+    /** Base delay in milliseconds between retries - doubles on each attempt (default 1000). */
+    retryDelay?: number;
+    /** Interval randomisation factor 0-1. 0.2 = ±20% variance (default 0). */
+    jitter?: number;
+    /** When true: fetch and diff but do not save snapshots or fire alerts. */
+    dryRun?: boolean;
+    /** Keep only the last N snapshots per URL (undefined = keep all). */
+    maxSnapshots?: number;
+    /** Minimum fraction 0-1 of content that must change before alerting (default 0). */
+    changeThreshold?: number;
+    /** Strip standalone numbers from text before diffing to ignore counter/date noise. */
+    ignoreNumbers?: boolean;
+    /** Fire onSilence after this many seconds without a detected change (undefined = disabled). */
+    alertIfNoChangeAfter?: number;
+    /** Called on every fetch or parse error. */
+    onError?: (err: Error, config: WatchConfig) => void;
+    /** Called when alertIfNoChangeAfter seconds have elapsed without a detected change. */
+    onSilence?: (info: SilenceInfo) => void;
 }
 
 export class WatchDiff {
     private readonly store: IStore;
-    private readonly configs: WatchConfig[]                                             = [];
+    private readonly configs: WatchConfig[]                                              = [];
     private readonly globalCallbacks: Array<(report: DiffReport) => void | Promise<void>> = [];
-    private scheduler: Scheduler | null                                                 = null;
-    private stopFn: (() => void) | null                                                 = null;
+    private scheduler: Scheduler | null                                                  = null;
+    private stopFn: (() => void) | null                                                  = null;
 
     /**
      * @param storageDir - Directory for JSON storage (default ".watchdiff").
@@ -101,19 +123,29 @@ export class WatchDiff {
 
         this.configs.push(
             makeWatchConfig(url, {
-                target:          opts.target,
-                interval:        opts.interval,
-                label:           opts.label,
-                headers:         opts.headers,
-                timeout:         opts.timeout,
-                ignoreSelectors: opts.ignoreSelectors,
-                ignorePatterns:  opts.ignorePatterns,
-                browser:         opts.browser,
-                browserOptions:  opts.browserOptions,
-                proxies:         opts.proxies,
-                userAgents:      opts.userAgents,
-                diffMode:        opts.diffMode,
-                cooldown:        opts.cooldown,
+                target:               opts.target,
+                interval:             opts.interval,
+                label:                opts.label,
+                headers:              opts.headers,
+                timeout:              opts.timeout,
+                ignoreSelectors:      opts.ignoreSelectors,
+                ignorePatterns:       opts.ignorePatterns,
+                browser:              opts.browser,
+                browserOptions:       opts.browserOptions,
+                proxies:              opts.proxies,
+                userAgents:           opts.userAgents,
+                diffMode:             opts.diffMode,
+                cooldown:             opts.cooldown,
+                retries:              opts.retries,
+                retryDelay:           opts.retryDelay,
+                jitter:               opts.jitter,
+                dryRun:               opts.dryRun,
+                maxSnapshots:         opts.maxSnapshots,
+                changeThreshold:      opts.changeThreshold,
+                ignoreNumbers:        opts.ignoreNumbers,
+                alertIfNoChangeAfter: opts.alertIfNoChangeAfter,
+                onError:              opts.onError,
+                onSilence:            opts.onSilence,
                 alert,
             })
         );
@@ -172,6 +204,50 @@ export class WatchDiff {
         const config = this.findConfig(url);
         const sched  = new Scheduler(this.store);
         return sched.checkOnce(config);
+    }
+
+    // ------------------------------------------------------------------
+    // Pause / Resume
+    // ------------------------------------------------------------------
+
+    /**
+     * Pause the watcher for a URL without removing it.
+     * No-op if monitoring has not started yet.
+     */
+    pause(url: string): void {
+        this.scheduler?.pause(url);
+    }
+
+    /**
+     * Resume a previously paused watcher.
+     */
+    resume(url: string): void {
+        this.scheduler?.resume(url);
+    }
+
+    // ------------------------------------------------------------------
+    // Status
+    // ------------------------------------------------------------------
+
+    /**
+     * Return runtime status for all registered watchers.
+     */
+    status(): WatcherStatus[] {
+        if (!this.scheduler) {
+            return this.configs.map((c) => ({
+                url:          c.url,
+                label:        c.label,
+                target:       c.target,
+                interval:     c.interval,
+                paused:       false,
+                lastCheckAt:  null,
+                nextCheckAt:  null,
+                lastChangeAt: null,
+                checksCount:  0,
+                changesCount: 0,
+            }));
+        }
+        return this.scheduler.getStatuses(this.configs);
     }
 
     // ------------------------------------------------------------------
