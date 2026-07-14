@@ -84,6 +84,7 @@ No noisy HTML diffs. No external services. No AI black boxes.
   - [SQLite storage backend](#sqlite-storage-backend)
   - [CSV and XLSX export](#csv-and-xlsx-export)
   - [Config file](#watchdiff-init---config-file)
+  - [Environment variables](#environment-variables)
 - [Types](#types)
 - [Helper functions](#helper-functions)
 - [CLI reference](#cli)
@@ -191,6 +192,7 @@ Register a URL to monitor.
 | `alertIfNoChangeAfter` | `number` | - | Fire `onSilence` after this many seconds without a detected change |
 | `onError` | `fn` | - | Called on fetch/parse errors instead of logging to console |
 | `onSilence` | `fn` | - | Called when `alertIfNoChangeAfter` seconds elapse without a change |
+| `webhookRetries` | `number` | `3` | Retry attempts for failed webhook deliveries (exponential backoff, `0` = no retry) |
 
 ```typescript
 wd
@@ -777,7 +779,9 @@ Generate a `watchdiff.config.json` template in the current directory:
 watchdiff init
 ```
 
-The generated file now includes all supported options:
+Config files are validated at startup. If a field has an invalid value (unknown `diffMode`, negative `interval`, malformed URL, etc.), watchdiff prints a clear error and exits instead of failing silently.
+
+The generated file includes all supported options:
 
 ```json
 {
@@ -805,6 +809,37 @@ The generated file now includes all supported options:
     }
   ]
 }
+```
+
+
+### Environment variables
+
+All CLI options accept a `WATCHDIFF_*` environment variable as a fallback. CLI flags always take precedence.
+
+| Variable | CLI equivalent | Example |
+|---|---|---|
+| `WATCHDIFF_STORAGE` | `-s, --storage` | `WATCHDIFF_STORAGE=.data` |
+| `WATCHDIFF_INTERVAL` | `-i, --interval` | `WATCHDIFF_INTERVAL=60` |
+| `WATCHDIFF_WEBHOOK` | `-w, --webhook` | `WATCHDIFF_WEBHOOK=https://discord.com/...` |
+| `WATCHDIFF_DIFF_MODE` | `--diff-mode` | `WATCHDIFF_DIFF_MODE=word` |
+| `WATCHDIFF_RETRIES` | `--retries` | `WATCHDIFF_RETRIES=3` |
+| `WATCHDIFF_COOLDOWN` | `--cooldown` | `WATCHDIFF_COOLDOWN=3600` |
+| `WATCHDIFF_JITTER` | `--jitter` | `WATCHDIFF_JITTER=0.2` |
+| `WATCHDIFF_BROWSER` | `--browser` | `WATCHDIFF_BROWSER=true` |
+| `WATCHDIFF_IGNORE_NUMBERS` | `--ignore-numbers` | `WATCHDIFF_IGNORE_NUMBERS=1` |
+| `WATCHDIFF_MAX_SNAPSHOTS` | `--max-snapshots` | `WATCHDIFF_MAX_SNAPSHOTS=100` |
+| `WATCHDIFF_CHANGE_THRESHOLD` | `--change-threshold` | `WATCHDIFF_CHANGE_THRESHOLD=0.05` |
+| `WATCHDIFF_ALERT_IF_NO_CHANGE` | `--alert-if-no-change` | `WATCHDIFF_ALERT_IF_NO_CHANGE=86400` |
+| `WATCHDIFF_LOG_FORMAT` | `--log-format` | `WATCHDIFF_LOG_FORMAT=json` |
+| `WATCHDIFF_TARGET` | `-t, --target` | `WATCHDIFF_TARGET=.price` |
+
+Useful for Docker or CI environments where you want to avoid hardcoding values in the config file:
+
+```bash
+WATCHDIFF_STORAGE=/data \
+WATCHDIFF_LOG_FORMAT=json \
+WATCHDIFF_WEBHOOK=https://hooks.slack.com/... \
+watchdiff run --config /etc/watchdiff.config.json
 ```
 
 
@@ -963,6 +998,9 @@ watchdiff run https://example.com --ignore-numbers
 # Silence alert after 24h without change
 watchdiff run https://example.com --alert-if-no-change 86400
 
+# Output logs as structured JSON (for ELK, Datadog, Loki, etc.)
+watchdiff run https://example.com --log-format json
+
 # Suppress all output except errors
 watchdiff run https://example.com -q
 
@@ -983,6 +1021,7 @@ watchdiff check https://example.com --target .price
 watchdiff check https://example.com --browser --diff-mode semantic
 watchdiff check https://example.com --dry-run
 watchdiff check https://example.com --json
+watchdiff check https://example.com --log-format json
 ```
 
 ### `status` - watcher status
