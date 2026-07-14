@@ -35,6 +35,7 @@ export type {
     DiffReport,
     SilenceInfo,
     SpikeInfo,
+    StatusChangeInfo,
     WatcherStatus,
 } from "./models.js";
 

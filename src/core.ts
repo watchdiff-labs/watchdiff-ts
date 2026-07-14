@@ -20,6 +20,7 @@ import {
     type IStore,
     type SilenceInfo,
     type SpikeInfo,
+    type StatusChangeInfo,
     type Snapshot,
     type WatchConfig,
     type WatcherStatus,
@@ -94,6 +95,10 @@ export interface WatchOptions {
     changeSpikeThreshold?: number;
     /** Called when a change spike is detected. */
     onSpike?: (info: SpikeInfo) => void;
+    /** Alert when the HTTP status code changes (e.g. 200 → 503 or 503 → 200). */
+    alertOnStatusChange?: boolean;
+    /** Called when the HTTP status code changes. */
+    onStatusChange?: (info: StatusChangeInfo) => void;
 }
 
 export class WatchDiff {
@@ -167,6 +172,8 @@ export class WatchDiff {
                 changeSpikeWindow:    opts.changeSpikeWindow,
                 changeSpikeThreshold: opts.changeSpikeThreshold,
                 onSpike:              opts.onSpike,
+                alertOnStatusChange:  opts.alertOnStatusChange,
+                onStatusChange:       opts.onStatusChange,
                 alert,
             })
         );
@@ -263,10 +270,11 @@ export class WatchDiff {
                 paused:       false,
                 lastCheckAt:  null,
                 nextCheckAt:  null,
-                lastChangeAt: null,
-                checksCount:  0,
-                changesCount: 0,
-                errorsCount:  0,
+                lastChangeAt:   null,
+                checksCount:    0,
+                changesCount:   0,
+                errorsCount:    0,
+                lastStatusCode: 0,
             }));
         }
         return this.scheduler.getStatuses(this.configs);

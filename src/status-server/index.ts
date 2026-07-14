@@ -126,6 +126,13 @@ function buildPrometheusMetrics(statuses: WatcherStatus[]): string {
         })
     );
 
+    metric(
+        "watchdiff_last_http_status",
+        "Last known HTTP status code (0 = unknown / unreachable).",
+        "gauge",
+        statuses.map((s) => `watchdiff_last_http_status{url="${labelEscape(s.url)}",label="${labelEscape(s.label)}"} ${s.lastStatusCode}`)
+    );
+
     lines.push("");
     return lines.join("\n");
 }

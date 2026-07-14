@@ -10,7 +10,14 @@ No noisy HTML diffs. No external services. No AI black boxes.
 - **CSS selectors AND XPath** - target any zone of any page
 - **JS-heavy pages** - optional Playwright headless browser rendering
 - **Proxy and User-Agent rotation** - avoid rate-limiting
-- **4 diff modes** - line, word, semantic, JSON
+- **5 diff modes** - line, word, semantic, JSON, RSS/Atom
+- **RSS / Atom monitoring** - item-level diff by guid/id
+- **HTML archiving** - save full page HTML to disk on every change
+- **Screenshot on change** - capture a PNG via Playwright on every detected change
+- **HTTP status monitoring** - alert when a URL returns a different status code (200 → 503, 503 → 200)
+- **Change spike detection** - alert when a page changes too frequently in a time window
+- **URL comparison** - diff two arbitrary URLs in a single command
+- **Built-in status server** - HTTP endpoints `/health`, `/status`, `/metrics` (Prometheus)
 - **SQLite backend** - optional, for high-volume workloads
 - **CSV / XLSX export** - full history export in one command
 - **Zero external services** - snapshots stored locally as JSON or SQLite
@@ -52,6 +59,13 @@ No noisy HTML diffs. No external services. No AI black boxes.
 | Ignore counters / dates | `ignoreNumbers: true` |
 | Require significant change | `changeThreshold: 0.05` (5% of content) |
 | Handle errors gracefully | `onError: (err) => myLogger.error(err)` |
+| Monitor an RSS/Atom feed | `diffMode: "rss"` |
+| Archive HTML on change | `archiveHtml: true` |
+| Screenshot on change | `screenshotOnChange: true` (requires `browser: true`) |
+| Detect change spikes | `changeSpikeWindow: 300, changeSpikeThreshold: 5` |
+| Monitor HTTP status | `alertOnStatusChange: true` + `onStatusChange: (info) => ...` |
+| Diff two URLs | `wd.compareUrls(urlA, urlB)` or `watchdiff compare <urlA> <urlB>` |
+| Expose status over HTTP | `wd.startStatusServer(9090)` or `--status-port 9090` |
 | CLI one-liner | `watchdiff run https://example.com --target .price --interval 60` |
 | Multi-URL config file | `watchdiff init` then edit `watchdiff.config.json` |
 | Show watcher status | `watchdiff status` |
@@ -81,6 +95,13 @@ No noisy HTML diffs. No external services. No AI black boxes.
   - [Ignore numbers](#ignore-numbers)
   - [Error callback](#error-callback)
   - [Webhook channels](#webhook-channels)
+  - [HTML archiving](#html-archiving)
+  - [Screenshot on change](#screenshot-on-change)
+  - [Change spike detection](#change-spike-detection)
+  - [HTTP status monitoring](#http-status-monitoring)
+  - [RSS / Atom monitoring](#rss--atom-monitoring)
+  - [URL comparison](#url-comparison)
+  - [Status server](#status-server)
   - [SQLite storage backend](#sqlite-storage-backend)
   - [CSV and XLSX export](#csv-and-xlsx-export)
   - [Config file](#watchdiff-init---config-file)
@@ -177,7 +198,7 @@ Register a URL to monitor.
 | `browserOptions` | `BrowserOptions` | - | Options for the headless browser |
 | `proxies` | `string[]` | `[]` | Proxy URLs to rotate through |
 | `userAgents` | `string[]` | `[]` | User-Agent strings to rotate through |
-| `diffMode` | `"line" \| "semantic" \| "word" \| "json"` | `"line"` | Diff granularity |
+| `diffMode` | `"line" \| "semantic" \| "word" \| "json" \| "rss"` | `"line"` | Diff granularity |
 | `onChange` | `fn \| fn[]` | - | Callback(s) receiving a `DiffReport` on each change |
 | `webhooks` | `string[]` | `[]` | Discord / Slack / Telegram / Teams / ntfy.sh / custom POST |
 | `minChanges` | `number` | `1` | Minimum changes required to trigger an alert |
@@ -193,6 +214,13 @@ Register a URL to monitor.
 | `onError` | `fn` | - | Called on fetch/parse errors instead of logging to console |
 | `onSilence` | `fn` | - | Called when `alertIfNoChangeAfter` seconds elapse without a change |
 | `webhookRetries` | `number` | `3` | Retry attempts for failed webhook deliveries (exponential backoff, `0` = no retry) |
+| `archiveHtml` | `boolean` | `false` | Save full-page HTML to `.watchdiff/archive/` on every detected change |
+| `screenshotOnChange` | `boolean` | `false` | Capture a PNG screenshot on change (requires `browser: true`) |
+| `changeSpikeWindow` | `number` | - | Spike detection time window in seconds |
+| `changeSpikeThreshold` | `number` | - | Alert when this many changes occur inside `changeSpikeWindow` |
+| `onSpike` | `fn` | - | Called when a change spike is detected |
+| `alertOnStatusChange` | `boolean` | `false` | Alert when the HTTP status code changes (e.g. `200 → 503` or `503 → 200`) |
+| `onStatusChange` | `fn` | - | Called when the HTTP status code changes |
 
 ```typescript
 wd
@@ -286,6 +314,7 @@ interface WatcherStatus {
   lastChangeAt: Date | null;
   checksCount:  number;
   changesCount: number;
+  errorsCount:  number;
 }
 ```
 
@@ -300,6 +329,37 @@ const reports   = wd.reports("https://example.com", 20);
 ### `.clear(url)`
 
 Delete all stored snapshots and reports for a URL.
+
+
+### `await .compareUrls(urlA, urlB, opts?)`
+
+Fetch and diff two arbitrary URLs in a single call. No storage is written.
+
+```typescript
+const report = await wd.compareUrls(
+  "https://example.com/v1",
+  "https://example.com/v2",
+  { target: ".content", diffMode: "word" }
+);
+console.log(report.changes.length, "difference(s)");
+```
+
+
+### `.startStatusServer(port?)` / `.stopStatusServer()`
+
+Start a lightweight HTTP server that exposes watcher state. Default port: `9090`.
+
+```typescript
+const wd = new WatchDiff();
+wd.watch("https://example.com", { interval: 60 });
+wd.startStatusServer(9090);
+const stop = wd.start();
+
+// Endpoints:
+// GET /health  → { "status": "ok" }
+// GET /status  → JSON array of WatcherStatus
+// GET /metrics → Prometheus text format
+```
 
 
 ### Export API
@@ -402,7 +462,7 @@ wd.watch("https://example.com", {
 
 ### Diff modes
 
-WatchDiff supports four diff modes selectable via `diffMode`:
+WatchDiff supports five diff modes selectable via `diffMode`:
 
 | Mode | Best for | Granularity |
 |---|---|---|
@@ -410,6 +470,7 @@ WatchDiff supports four diff modes selectable via `diffMode`:
 | `"semantic"` | Blog posts, news articles, structured pages | Paragraph / heading / cell |
 | `"word"` | Short values, prices, status text | Word by word |
 | `"json"` | REST APIs, JSON feeds | Nested key path |
+| `"rss"` | RSS 2.0 and Atom feeds | Item by item (guid / id) |
 
 **`line` mode (default)**
 
@@ -462,6 +523,30 @@ wd.watch("https://api.example.com/product/42", {
 ```
 
 Falls back to line diff automatically when the content cannot be parsed as JSON.
+
+**`rss` mode**
+
+Designed for RSS 2.0 and Atom feeds. Parses the XML, identifies items by `guid` (RSS) or `id`
+(Atom), and reports each item as added, removed, or modified - instead of a raw XML diff.
+
+```typescript
+wd.watch("https://news.example.com/feed.xml", {
+  diffMode: "rss",
+  label:    "News feed",
+  onChange: (report) => {
+    for (const c of report.changes) {
+      // c.kind = "added" | "removed" | "modified"
+      // c.after / c.before = item title
+      // c.context = item link or guid
+      console.log(changeHuman(c));
+    }
+  },
+});
+// [+] Added: "New article title"
+// [-] Removed: "Old article title"
+```
+
+Falls back to line diff automatically when no `<item>` or `<entry>` elements are found.
 
 
 ### Alert cooldown
@@ -712,6 +797,237 @@ wd.watch("https://example.com", {
 ```
 
 
+### HTML archiving
+
+Save the raw HTML of the full page to disk whenever a change is detected. Files are written
+to `<storageDir>/archive/<urlhash>_<timestamp>.html`.
+
+```typescript
+wd.watch("https://example.com", {
+  archiveHtml: true,
+  interval:    300,
+});
+```
+
+```bash
+watchdiff run https://example.com --archive-html
+```
+
+Archived files are never pruned automatically - manage retention yourself if storage matters.
+
+
+### Screenshot on change
+
+Capture a full-page PNG screenshot whenever a change is detected. Requires `browser: true`
+(Playwright). Files are written to `<storageDir>/archive/<urlhash>_<timestamp>.png`.
+
+```typescript
+wd.watch("https://example.com/dashboard", {
+  browser:            true,
+  screenshotOnChange: true,
+  interval:           120,
+});
+```
+
+```bash
+watchdiff run https://example.com --browser --screenshot
+```
+
+A failed screenshot is logged as a warning but does not interrupt the normal diff pipeline.
+
+
+### Change spike detection
+
+Alert when a page changes too frequently within a rolling time window. Useful for detecting
+flapping deployments, feed storms, or runaway content updates.
+
+```typescript
+wd.watch("https://example.com/live", {
+  interval:             30,
+  changeSpikeWindow:    300,    // 5-minute window
+  changeSpikeThreshold: 5,      // alert if ≥ 5 changes in that window
+  onSpike: ({ url, label, changesInWindow, windowSeconds }) => {
+    console.warn(`${label}: ${changesInWindow} changes in ${windowSeconds}s`);
+    sendAlert(`Spike detected on ${url}`);
+  },
+});
+```
+
+The `onSpike` callback fires at most once per `changeSpikeWindow` seconds to avoid repeated
+alerts during the same spike.
+
+```typescript
+interface SpikeInfo {
+  url:             string;
+  label:           string;
+  changesInWindow: number;  // number of changes detected inside the window
+  windowSeconds:   number;  // width of the spike detection window
+}
+```
+
+
+### RSS / Atom monitoring
+
+Use `diffMode: "rss"` to monitor RSS 2.0 and Atom feeds at the item level. WatchDiff parses
+the XML, identifies items by `guid` (RSS) or `id` (Atom), and reports added, removed, and
+modified items individually - much cleaner than a raw XML line diff.
+
+```typescript
+wd.watch("https://hnrss.org/frontpage", {
+  diffMode: "rss",
+  label:    "Hacker News front page",
+  interval: 300,
+  onChange: (report) => {
+    for (const c of report.changes) {
+      console.log(changeHuman(c));
+      // [+] Added: "Show HN: My project" (https://news.ycombinator.com/item?id=42)
+    }
+  },
+});
+```
+
+```bash
+watchdiff run https://hnrss.org/frontpage --diff-mode rss
+```
+
+Falls back to line diff if no `<item>` or `<entry>` elements are found.
+
+
+### HTTP status monitoring
+
+Detect HTTP-level failures independently of content changes. When `alertOnStatusChange: true`,
+WatchDiff compares the HTTP status code on each check and alerts when it changes - even if the
+page content looks identical.
+
+Typical use cases: detect a site going down (`200 → 503`), a page being deleted (`200 → 404`),
+or a server recovering from an outage (`503 → 200`).
+
+```typescript
+wd.watch("https://example.com", {
+  interval:             60,
+  alertOnStatusChange:  true,
+  onStatusChange: ({ url, label, previousStatus, currentStatus }) => {
+    if (currentStatus === 200) {
+      console.log(`✅ ${label} recovered (${previousStatus} → 200)`);
+    } else {
+      console.error(`🔴 ${label} is down: ${previousStatus} → ${currentStatus}`);
+    }
+  },
+  // Optionally combine with webhooks for instant notifications
+  webhooks: ["https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"],
+});
+```
+
+```bash
+watchdiff run https://example.com --alert-on-status-change --webhook https://ntfy.sh/my-topic
+```
+
+Status codes:
+- `0` : unreachable (network error, DNS failure, timeout)
+- `200` : ok
+- `403` : forbidden
+- `404` : not found
+- `429` : rate limited
+- `503` : service unavailable
+
+The `/metrics` endpoint also exposes a `watchdiff_last_http_status` gauge per URL.
+
+```typescript
+interface StatusChangeInfo {
+  url:            string;
+  label:          string;
+  previousStatus: number;
+  currentStatus:  number;  // 0 = unreachable
+}
+```
+
+
+### URL comparison
+
+Compare two arbitrary URLs on the spot without any persistent storage. Useful for comparing
+staging vs production, two versions of a page, or two different APIs.
+
+**API:**
+
+```typescript
+const wd     = new WatchDiff();
+const report = await wd.compareUrls(
+  "https://staging.example.com/product/42",
+  "https://www.example.com/product/42",
+  { target: ".price", diffMode: "word" }
+);
+
+if (report.changes.length === 0) {
+  console.log("Identical.");
+} else {
+  for (const c of report.changes) console.log(changeHuman(c));
+}
+```
+
+**CLI:**
+
+```bash
+watchdiff compare https://staging.example.com https://www.example.com
+watchdiff compare https://staging.example.com https://www.example.com --target .price --diff-mode word
+watchdiff compare https://api.example.com/v1/data https://api.example.com/v2/data --diff-mode json
+watchdiff compare https://a.example.com https://b.example.com --json
+```
+
+
+### Status server
+
+Start a lightweight HTTP server to expose watcher state for dashboards, load balancers,
+and Prometheus scrapers - no extra dependencies, pure Node.js `http`.
+
+**API:**
+
+```typescript
+const wd = new WatchDiff();
+wd.watch("https://example.com", { interval: 60 });
+wd.startStatusServer(9090);
+wd.start();
+
+// wd.stopStatusServer();  - stops the HTTP server
+```
+
+**CLI:**
+
+```bash
+watchdiff run https://example.com --interval 60 --status-port 9090
+```
+
+**Endpoints:**
+
+| Endpoint | Response |
+|---|---|
+| `GET /health` | `200 { "status": "ok" }` |
+| `GET /status` | `200` JSON array of `WatcherStatus` |
+| `GET /metrics` | `200` Prometheus text exposition format |
+
+**`/metrics` example:**
+
+```
+# HELP watchdiff_checks_total Total number of checks performed per URL.
+# TYPE watchdiff_checks_total counter
+watchdiff_checks_total{url="https://example.com",label="example.com"} 42
+
+# HELP watchdiff_changes_total Total number of checks that produced at least one change.
+# TYPE watchdiff_changes_total counter
+watchdiff_changes_total{url="https://example.com",label="example.com"} 3
+
+# HELP watchdiff_errors_total Total number of fetch or parse errors.
+# TYPE watchdiff_errors_total counter
+watchdiff_errors_total{url="https://example.com",label="example.com"} 0
+
+# HELP watchdiff_paused 1 if the watcher is currently paused, 0 otherwise.
+# TYPE watchdiff_paused gauge
+watchdiff_paused{url="https://example.com",label="example.com"} 0
+```
+
+The server calls `.unref()` on the underlying socket - it will not keep the Node.js process
+alive on its own.
+
+
 ### SQLite storage backend
 
 The default storage writes one JSON file per watched URL. For high-volume monitoring
@@ -832,6 +1148,11 @@ All CLI options accept a `WATCHDIFF_*` environment variable as a fallback. CLI f
 | `WATCHDIFF_ALERT_IF_NO_CHANGE` | `--alert-if-no-change` | `WATCHDIFF_ALERT_IF_NO_CHANGE=86400` |
 | `WATCHDIFF_LOG_FORMAT` | `--log-format` | `WATCHDIFF_LOG_FORMAT=json` |
 | `WATCHDIFF_TARGET` | `-t, --target` | `WATCHDIFF_TARGET=.price` |
+| `WATCHDIFF_ARCHIVE_HTML` | `--archive-html` | `WATCHDIFF_ARCHIVE_HTML=true` |
+| `WATCHDIFF_SCREENSHOT` | `--screenshot` | `WATCHDIFF_SCREENSHOT=true` |
+| `WATCHDIFF_SPIKE_WINDOW` | `--spike-window` | `WATCHDIFF_SPIKE_WINDOW=300` |
+| `WATCHDIFF_SPIKE_THRESHOLD` | `--spike-threshold` | `WATCHDIFF_SPIKE_THRESHOLD=5` |
+| `WATCHDIFF_ALERT_ON_STATUS_CHANGE` | `--alert-on-status-change` | `WATCHDIFF_ALERT_ON_STATUS_CHANGE=true` |
 
 Useful for Docker or CI environments where you want to avoid hardcoding values in the config file:
 
@@ -897,6 +1218,29 @@ interface WatcherStatus {
   lastChangeAt: Date | null;
   checksCount:  number;
   changesCount: number;
+  errorsCount:  number;
+}
+```
+
+### `SpikeInfo`
+
+```typescript
+interface SpikeInfo {
+  url:             string;
+  label:           string;
+  changesInWindow: number;
+  windowSeconds:   number;
+}
+```
+
+### `StatusChangeInfo`
+
+```typescript
+interface StatusChangeInfo {
+  url:            string;
+  label:          string;
+  previousStatus: number;
+  currentStatus:  number;  // 0 = unreachable (network error / timeout)
 }
 ```
 
@@ -998,6 +1342,24 @@ watchdiff run https://example.com --ignore-numbers
 # Silence alert after 24h without change
 watchdiff run https://example.com --alert-if-no-change 86400
 
+# Archive HTML on every change
+watchdiff run https://example.com --archive-html
+
+# Take a screenshot on every change (requires --browser)
+watchdiff run https://example.com --browser --screenshot
+
+# Alert when ≥ 5 changes happen within 5 minutes
+watchdiff run https://example.com --spike-window 300 --spike-threshold 5
+
+# Expose status / metrics over HTTP
+watchdiff run https://example.com --interval 60 --status-port 9090
+
+# RSS feed monitoring
+watchdiff run https://hnrss.org/frontpage --diff-mode rss
+
+# Alert on HTTP status change (200 → 503, 503 → 200, etc.)
+watchdiff run https://example.com --alert-on-status-change
+
 # Output logs as structured JSON (for ELK, Datadog, Loki, etc.)
 watchdiff run https://example.com --log-format json
 
@@ -1022,6 +1384,24 @@ watchdiff check https://example.com --browser --diff-mode semantic
 watchdiff check https://example.com --dry-run
 watchdiff check https://example.com --json
 watchdiff check https://example.com --log-format json
+```
+
+### `compare` - diff two URLs
+
+Fetch and diff two URLs on the spot. No storage is written.
+
+```bash
+# Basic comparison
+watchdiff compare https://staging.example.com https://www.example.com
+
+# With a CSS selector and word-level diff
+watchdiff compare https://staging.example.com https://www.example.com --target .price --diff-mode word
+
+# JSON API diff
+watchdiff compare https://api.example.com/v1/data https://api.example.com/v2/data --diff-mode json
+
+# Machine-readable output
+watchdiff compare https://a.example.com https://b.example.com --json
 ```
 
 ### `status` - watcher status
@@ -1200,10 +1580,12 @@ wd.start();
 
 | Feature | Package to install |
 |---|---|
-| JS-heavy pages | `npm install playwright && npx playwright install chromium` |
+| JS-heavy pages / screenshots | `npm install playwright && npx playwright install chromium` |
 | SQLite storage | `npm install better-sqlite3` |
 | XLSX export | `npm install exceljs` |
 | Proxy rotation (native fetch) | bundled via `undici` (no extra install) |
+| RSS/Atom diff | bundled via `@xmldom/xmldom` (no extra install) |
+| Status server / Prometheus metrics | built-in Node.js `http` (no extra install) |
 
 ## Development
 

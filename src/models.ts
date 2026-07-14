@@ -43,6 +43,13 @@ export interface SilenceInfo {
     secondsSinceLastChange: number;
 }
 
+export interface StatusChangeInfo {
+    url:            string;
+    label:          string;
+    previousStatus: number;
+    currentStatus:  number;
+}
+
 export interface SpikeInfo {
     url: string;
     label: string;
@@ -113,6 +120,10 @@ export interface WatchConfig {
     changeSpikeThreshold?: number;
     /** Called when a change spike is detected. */
     onSpike?: (info: SpikeInfo) => void;
+    /** Alert when the HTTP status code changes (e.g. 200 → 503 or 503 → 200). */
+    alertOnStatusChange?: boolean;
+    /** Called when the HTTP status code changes. */
+    onStatusChange?: (info: StatusChangeInfo) => void;
     alert?: AlertConfig;
 }
 
@@ -151,6 +162,8 @@ export function makeWatchConfig(
         changeSpikeWindow:      opts.changeSpikeWindow,
         changeSpikeThreshold:   opts.changeSpikeThreshold,
         onSpike:                opts.onSpike,
+        alertOnStatusChange:    opts.alertOnStatusChange,
+        onStatusChange:         opts.onStatusChange,
         alert:                  opts.alert,
     };
 }
@@ -276,6 +289,8 @@ export interface WatcherStatus {
     changesCount: number;
     /** Total number of fetch or parse errors since start. */
     errorsCount: number;
+    /** Last known HTTP status code (0 = unknown / unreachable, 200 = ok). */
+    lastStatusCode: number;
 }
 
 // ---------------------------------------------------------------------------

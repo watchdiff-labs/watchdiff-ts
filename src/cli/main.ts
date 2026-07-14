@@ -8,7 +8,7 @@ import type { WatchOptions } from "../core.js";
 program
     .name("watchdiff")
     .description("Lightweight web change monitoring - clean diffs, no AI required.")
-    .version("0.1.5");
+    .version("0.1.6");
 
 // ---------------------------------------------------------------------------
 // run
@@ -39,6 +39,7 @@ program
     .option("--spike-window <sec>",       "Spike detection time window in seconds")
     .option("--spike-threshold <n>",      "Alert when N changes occur inside the spike window")
     .option("--status-port <port>",       "Start HTTP status server on this port (/health /status /metrics)")
+    .option("--alert-on-status-change",   "Alert when the HTTP status code changes (e.g. 200 → 503)")
     .option("--log-format <format>",      "Log format: 'text' (default) or 'json' (env: WATCHDIFF_LOG_FORMAT)")
     .option("-q, --quiet",                "Suppress all output except errors")
     .option("-v, --verbose",              "Show debug output (no-change ticks, cooldown skips, etc.)")
@@ -696,6 +697,7 @@ function buildWatchOptions(opts: Record<string, string | boolean | undefined>): 
     if (spikeWindow !== undefined)           result.changeSpikeWindow    = spikeWindow;
     const spikeThreshold = num("spikeThreshold", "WATCHDIFF_SPIKE_THRESHOLD");
     if (spikeThreshold !== undefined)        result.changeSpikeThreshold = spikeThreshold;
+    if (bool("alertOnStatusChange", "WATCHDIFF_ALERT_ON_STATUS_CHANGE")) result.alertOnStatusChange = true;
 
     return result;
 }

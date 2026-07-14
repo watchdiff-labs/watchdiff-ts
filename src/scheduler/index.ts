@@ -22,6 +22,7 @@ import {
     type IStore,
     type SilenceInfo,
     type SpikeInfo,
+    type StatusChangeInfo,
     type WatchConfig,
     type WatcherStatus,
 } from "../models.js";
@@ -43,6 +44,7 @@ interface UrlState {
     lastSilenceAt:     number;
     recentChangeTimes: number[];
     lastSpikeAt:       number;
+    lastStatusCode:    number;
 }
 
 const NUMBERS_PATTERN = /\b\d+(\.\d+)?\b/g;
@@ -144,9 +146,10 @@ export class Scheduler {
                 lastCheckAt:  state.lastCheckAt,
                 nextCheckAt:  state.nextCheckAt,
                 lastChangeAt: state.lastChangeAt,
-                checksCount:  state.checksCount,
-                changesCount: state.changesCount,
-                errorsCount:  state.errorsCount,
+                checksCount:    state.checksCount,
+                changesCount:   state.changesCount,
+                errorsCount:    state.errorsCount,
+                lastStatusCode: state.lastStatusCode,
             };
         });
     }
@@ -174,11 +177,51 @@ export class Scheduler {
             lastSilenceAt:     0,
             recentChangeTimes: [],
             lastSpikeAt:       0,
+            lastStatusCode:    0,
         };
     }
 
     private getState(config: WatchConfig): UrlState {
         return this.urlStates.get(config.url) ?? this.makeEmptyState();
+    }
+
+    private async handleStatusChange(state: UrlState, currentStatus: number, config: WatchConfig, now: number): Promise<void> {
+        const prev = state.lastStatusCode;
+        state.lastStatusCode = currentStatus;
+
+        if (!config.alertOnStatusChange || prev === 0 || prev === currentStatus) return;
+
+        const info: StatusChangeInfo = {
+            url:            config.url,
+            label:          config.label,
+            previousStatus: prev,
+            currentStatus,
+        };
+
+        const label = currentStatus === 200
+            ? `recovered (${prev} → 200)`
+            : `${prev} → ${currentStatus || "unreachable"}`;
+
+        console.warn(`[${config.label}] HTTP status changed: ${label}`);
+
+        if (config.onStatusChange) {
+            try { config.onStatusChange(info); } catch (err) {
+                console.warn("[watchdiff] onStatusChange callback error:", err);
+            }
+        }
+
+        if (!config.dryRun && config.alert) {
+            const fakeReport = {
+                url:        config.url,
+                target:     config.target,
+                label:      config.label,
+                changes:    [{ kind: "modified" as const, before: String(prev), after: String(currentStatus || "unreachable"), context: "http_status" }],
+                comparedAt: new Date(now),
+                before:     { url: config.url, target: config.target, content: "", rawHtml: "", capturedAt: new Date(now), checksum: "" },
+                after:      { url: config.url, target: config.target, content: "", rawHtml: "", capturedAt: new Date(now), checksum: "" },
+            };
+            await this.notifier.notify(fakeReport, config.alert);
+        }
     }
 
     /** Compute interval with optional ±jitter. */
@@ -204,8 +247,16 @@ export class Scheduler {
             html = config.browser
                 ? await this.browserFetcher.fetch(config)
                 : await this.fetcher.fetch(config);
+
+            // Fetch succeeded - status is 200
+            await this.handleStatusChange(state, 200, config, now);
         } catch (err) {
             state.errorsCount++;
+            const fetchErr      = err instanceof FetchError ? err : null;
+            const currentStatus = fetchErr?.statusCode ?? 0;
+
+            await this.handleStatusChange(state, currentStatus, config, now);
+
             const error = err instanceof Error ? err : new Error(String(err));
             if (config.onError) {
                 config.onError(error, config);
