@@ -5,9 +5,20 @@
  * Install: npm install playwright && npx playwright install chromium
  */
 
-import { chromium } from "playwright";
 import { FetchError } from "./index.js";
 import type { WatchConfig } from "../models.js";
+
+type ChromiumType = {
+    launch(opts: Record<string, unknown>): Promise<{
+        newPage(): Promise<{
+            setExtraHTTPHeaders(headers: Record<string, string>): Promise<void>;
+            goto(url: string, opts: Record<string, unknown>): Promise<void>;
+            waitForSelector(selector: string, opts: Record<string, unknown>): Promise<void>;
+            content(): Promise<string>;
+        }>;
+        close(): Promise<void>;
+    }>;
+};
 
 export class BrowserFetcher {
     /**
@@ -17,6 +28,8 @@ export class BrowserFetcher {
      * @throws FetchError if playwright is not installed or navigation fails
      */
     async fetch(config: WatchConfig): Promise<string> {
+        const chromium = await this.loadChromium();
+
         const opts    = config.browserOptions ?? {};
         const timeout = config.timeout;
 
@@ -31,7 +44,7 @@ export class BrowserFetcher {
             launchOpts["proxy"] = { server: proxy };
         }
 
-        let browser: Awaited<ReturnType<typeof chromium.launch>>;
+        let browser: Awaited<ReturnType<ChromiumType["launch"]>>;
         try {
             browser = await chromium.launch(launchOpts);
         } catch (err) {
@@ -69,6 +82,17 @@ export class BrowserFetcher {
             );
         } finally {
             await browser.close();
+        }
+    }
+
+    private async loadChromium(): Promise<ChromiumType> {
+        try {
+            const pw = await import("playwright") as { chromium: ChromiumType };
+            return pw.chromium;
+        } catch {
+            throw new FetchError(
+                "Playwright is not installed. Run: npm install playwright && npx playwright install chromium"
+            );
         }
     }
 }

@@ -32,6 +32,8 @@ export interface AlertConfig {
     webhooks: string[];
     /** Minimum number of changes required to trigger an alert. */
     minChanges: number;
+    /** Number of retry attempts for failed webhook deliveries (default 3, 0 = no retry). */
+    webhookRetries?: number;
 }
 
 export interface SilenceInfo {
@@ -90,6 +92,8 @@ export interface WatchConfig {
     onError?: (err: Error, config: WatchConfig) => void;
     /** Called when alertIfNoChangeAfter seconds have elapsed without a detected change. */
     onSilence?: (info: SilenceInfo) => void;
+    /** Number of retry attempts for failed webhook deliveries (default 3). */
+    webhookRetries?: number;
     alert?: AlertConfig;
 }
 
@@ -122,6 +126,7 @@ export function makeWatchConfig(
         alertIfNoChangeAfter:   opts.alertIfNoChangeAfter,
         onError:                opts.onError,
         onSilence:              opts.onSilence,
+        webhookRetries:         opts.webhookRetries,
         alert:                  opts.alert,
     };
 }

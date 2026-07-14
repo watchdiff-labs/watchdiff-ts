@@ -20,6 +20,9 @@ import {
     type DiffReport,
 } from "../models.js";
 
+const DEFAULT_WEBHOOK_RETRIES = 3;
+const RETRY_BASE_DELAY_MS     = 500;
+
 export class Notifier {
     async notify(report: DiffReport, alert: AlertConfig): Promise<void> {
         if (!reportHasChanges(report)) return;
@@ -34,24 +37,46 @@ export class Notifier {
             }
         }
 
-        // 2. Webhooks
-        await Promise.allSettled(alert.webhooks.map((url) => this.sendWebhook(url, report)));
+        // 2. Webhooks (with retry)
+        const maxAttempts = (alert.webhookRetries ?? DEFAULT_WEBHOOK_RETRIES) + 1;
+        await Promise.allSettled(
+            alert.webhooks.map((url) => this.sendWebhookWithRetry(url, report, maxAttempts))
+        );
+    }
+
+    private async sendWebhookWithRetry(
+        url:         string,
+        report:      DiffReport,
+        maxAttempts: number
+    ): Promise<void> {
+        let lastErr: unknown;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                await this.sendWebhook(url, report);
+                return;
+            } catch (err) {
+                lastErr = err;
+                if (attempt < maxAttempts) {
+                    await sleep(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+                }
+            }
+        }
+        console.warn(
+            `[watchdiff] Webhook failed after ${maxAttempts} attempt(s) (${url}):`,
+            lastErr
+        );
     }
 
     private async sendWebhook(url: string, report: DiffReport): Promise<void> {
         const { payload, headers } = this.buildPayload(url, report);
-        try {
-            const res = await globalThis.fetch(url, {
-                method:  "POST",
-                headers: { "Content-Type": "application/json", ...headers },
-                body:    JSON.stringify(payload),
-                signal:  AbortSignal.timeout(10_000),
-            });
-            if (!res.ok) {
-                console.warn(`[watchdiff] Webhook ${url} returned ${res.status}`);
-            }
-        } catch (err) {
-            console.warn(`[watchdiff] Webhook request error (${url}):`, err);
+        const res = await globalThis.fetch(url, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json", ...headers },
+            body:    JSON.stringify(payload),
+            signal:  AbortSignal.timeout(10_000),
+        });
+        if (!res.ok) {
+            throw new Error(`Webhook ${url} returned ${res.status}`);
         }
     }
 
@@ -119,4 +144,8 @@ export class Notifier {
         // Generic
         return { payload: reportAsDict(report), headers: {} };
     }
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }

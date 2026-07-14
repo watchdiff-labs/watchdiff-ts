@@ -80,6 +80,8 @@ export interface WatchOptions {
     onError?: (err: Error, config: WatchConfig) => void;
     /** Called when alertIfNoChangeAfter seconds have elapsed without a detected change. */
     onSilence?: (info: SilenceInfo) => void;
+    /** Number of retry attempts for failed webhook deliveries (default 3, 0 = no retry). */
+    webhookRetries?: number;
 }
 
 export class WatchDiff {
@@ -115,9 +117,10 @@ export class WatchDiff {
         const alert: AlertConfig | undefined =
             callbacks.length > 0 || (opts.webhooks?.length ?? 0) > 0
                 ? {
-                    onChange:   callbacks,
-                    webhooks:   opts.webhooks ?? [],
-                    minChanges: opts.minChanges ?? 1,
+                    onChange:       callbacks,
+                    webhooks:       opts.webhooks ?? [],
+                    minChanges:     opts.minChanges ?? 1,
+                    webhookRetries: opts.webhookRetries,
                 }
                 : undefined;
 

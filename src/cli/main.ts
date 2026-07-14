@@ -8,7 +8,7 @@ import type { WatchOptions } from "../core.js";
 program
     .name("watchdiff")
     .description("Lightweight web change monitoring - clean diffs, no AI required.")
-    .version("0.1.3");
+    .version("0.1.4");
 
 // ---------------------------------------------------------------------------
 // run
@@ -18,27 +18,28 @@ program
     .command("run [url]")
     .description("Start continuous monitoring (Ctrl+C to stop). Pass a URL or --config file.")
     .option("-t, --target <selector>",    "CSS selector or XPath expression to watch")
-    .option("-i, --interval <seconds>",   "Seconds between checks", "300")
-    .option("-w, --webhook <url>",        "Webhook URL to POST on change")
-    .option("-s, --storage <dir>",        "Storage directory", ".watchdiff")
+    .option("-i, --interval <seconds>",   "Seconds between checks (env: WATCHDIFF_INTERVAL)")
+    .option("-w, --webhook <url>",        "Webhook URL to POST on change (env: WATCHDIFF_WEBHOOK)")
+    .option("-s, --storage <dir>",        "Storage directory (env: WATCHDIFF_STORAGE)")
     .option("-c, --config <file>",        "JSON config file (watchdiff.config.json)")
-    .option("--browser",                  "Use headless Playwright browser for JS-heavy pages")
+    .option("--browser",                  "Use headless Playwright browser for JS-heavy pages (env: WATCHDIFF_BROWSER)")
     .option("--proxy <url>",              "Proxy URL (e.g. http://user:pass@host:port)")
     .option("--user-agent <ua>",          "Custom User-Agent string")
-    .option("--diff-mode <mode>",         "Diff mode: 'line' (default), 'semantic', 'word', or 'json'")
-    .option("--cooldown <seconds>",       "Minimum seconds between two alerts for the same URL (anti-spam)")
-    .option("--retries <n>",              "Number of fetch retries on error (default 0)")
-    .option("--jitter <factor>",          "Interval jitter 0-1, e.g. 0.2 = ±20% variance (default 0)")
+    .option("--diff-mode <mode>",         "Diff mode: 'line' (default), 'semantic', 'word', or 'json' (env: WATCHDIFF_DIFF_MODE)")
+    .option("--cooldown <seconds>",       "Minimum seconds between two alerts for the same URL (env: WATCHDIFF_COOLDOWN)")
+    .option("--retries <n>",              "Number of fetch retries on error (env: WATCHDIFF_RETRIES)")
+    .option("--jitter <factor>",          "Interval jitter 0-1, e.g. 0.2 = ±20% variance (env: WATCHDIFF_JITTER)")
     .option("--dry-run",                  "Fetch and diff without saving or alerting")
     .option("--max-snapshots <n>",        "Keep only the last N snapshots per URL")
     .option("--change-threshold <ratio>", "Minimum fraction 0-1 of content that must change to alert")
     .option("--ignore-numbers",           "Ignore standalone number changes (counters, dates)")
     .option("--alert-if-no-change <sec>", "Fire silence alert after N seconds without a change")
+    .option("--log-format <format>",      "Log format: 'text' (default) or 'json' (env: WATCHDIFF_LOG_FORMAT)")
     .option("-q, --quiet",                "Suppress all output except errors")
     .option("-v, --verbose",              "Show debug output (no-change ticks, cooldown skips, etc.)")
     .action((url: string | undefined, opts: Record<string, string | boolean | undefined>) => {
-        applyVerbosity(opts);
-        const storage = (opts["storage"] as string | undefined) ?? ".watchdiff";
+        applyOutput(opts);
+        const storage = (opts["storage"] as string | undefined) ?? process.env["WATCHDIFF_STORAGE"] ?? ".watchdiff";
         const wd      = new WatchDiff(storage);
 
         if (opts["config"]) {
@@ -92,9 +93,10 @@ program
     .option("--retries <n>",             "Number of fetch retries on error")
     .option("--dry-run",                 "Fetch and diff without saving")
     .option("--json",                    "Output raw JSON")
+    .option("--log-format <format>",     "Log format: 'text' (default) or 'json'")
     .option("-q, --quiet",               "Suppress all output except errors")
     .action(async (url: string, opts: Record<string, string | boolean | undefined>) => {
-        applyVerbosity(opts);
+        applyOutput(opts);
         const wd = new WatchDiff((opts["storage"] as string | undefined) ?? ".watchdiff");
         wd.watch(url, buildWatchOptions(opts));
 
@@ -410,42 +412,137 @@ program
 interface ConfigFile {
     storage?: string;
     watches: Array<{
-        url:                  string;
-        target?:              string;
-        interval?:            number;
-        label?:               string;
-        browser?:             boolean;
-        diffMode?:            string;
-        webhooks?:            string[];
-        ignoreSelectors?:     string[];
-        proxies?:             string[];
-        userAgents?:          string[];
-        headers?:             Record<string, string>;
-        timeout?:             number;
-        minChanges?:          number;
-        cooldown?:            number;
-        retries?:             number;
-        retryDelay?:          number;
-        jitter?:              number;
-        dryRun?:              boolean;
-        maxSnapshots?:        number;
-        changeThreshold?:     number;
-        ignoreNumbers?:       boolean;
+        url:                   string;
+        target?:               string;
+        interval?:             number;
+        label?:                string;
+        browser?:              boolean;
+        diffMode?:             string;
+        webhooks?:             string[];
+        ignoreSelectors?:      string[];
+        proxies?:              string[];
+        userAgents?:           string[];
+        headers?:              Record<string, string>;
+        timeout?:              number;
+        minChanges?:           number;
+        cooldown?:             number;
+        retries?:              number;
+        retryDelay?:           number;
+        jitter?:               number;
+        dryRun?:               boolean;
+        maxSnapshots?:         number;
+        changeThreshold?:      number;
+        ignoreNumbers?:        boolean;
         alertIfNoChangeAfter?: number;
+        webhookRetries?:       number;
     }>;
 }
+
+// ---------------------------------------------------------------------------
+// Config validation
+// ---------------------------------------------------------------------------
+
+const VALID_DIFF_MODES = new Set(["line", "semantic", "word", "json"]);
+
+interface ConfigError { path: string; message: string; }
+
+function validateConfigFile(raw: unknown, filePath: string): void {
+    const errors: ConfigError[] = [];
+
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+        errors.push({ path: "", message: "root must be an object" });
+        exitWithConfigErrors(errors, filePath);
+    }
+
+    const cfg = raw as Record<string, unknown>;
+
+    if (!Array.isArray(cfg["watches"])) {
+        errors.push({ path: "watches", message: "must be an array" });
+        exitWithConfigErrors(errors, filePath);
+    }
+
+    const watches = cfg["watches"] as unknown[];
+    if (watches.length === 0) {
+        errors.push({ path: "watches", message: "array must not be empty" });
+    }
+
+    for (let i = 0; i < watches.length; i++) {
+        const w   = watches[i];
+        const pfx = `watches[${i}]`;
+
+        if (typeof w !== "object" || w === null || Array.isArray(w)) {
+            errors.push({ path: pfx, message: "must be an object" });
+            continue;
+        }
+
+        const e = w as Record<string, unknown>;
+
+        if (typeof e["url"] !== "string" || !e["url"]) {
+            errors.push({ path: `${pfx}.url`, message: "required string" });
+        } else {
+            try { new URL(e["url"]); } catch {
+                errors.push({ path: `${pfx}.url`, message: `invalid URL: ${e["url"]}` });
+            }
+        }
+
+        if (e["diffMode"] !== undefined && !VALID_DIFF_MODES.has(String(e["diffMode"]))) {
+            errors.push({ path: `${pfx}.diffMode`, message: `must be one of: ${[...VALID_DIFF_MODES].join(", ")}` });
+        }
+
+        for (const key of ["jitter", "changeThreshold"] as const) {
+            const v = e[key];
+            if (v !== undefined && (typeof v !== "number" || v < 0 || v > 1)) {
+                errors.push({ path: `${pfx}.${key}`, message: "must be a number between 0 and 1" });
+            }
+        }
+
+        for (const key of ["interval", "timeout", "cooldown", "retries", "retryDelay", "maxSnapshots", "alertIfNoChangeAfter", "minChanges", "webhookRetries"] as const) {
+            const v = e[key];
+            if (v !== undefined && (typeof v !== "number" || v < 0)) {
+                errors.push({ path: `${pfx}.${key}`, message: "must be a non-negative number" });
+            }
+        }
+
+        for (const key of ["webhooks", "ignoreSelectors", "proxies", "userAgents"] as const) {
+            if (e[key] !== undefined && !Array.isArray(e[key])) {
+                errors.push({ path: `${pfx}.${key}`, message: "must be an array" });
+            }
+        }
+
+        if (e["headers"] !== undefined && (typeof e["headers"] !== "object" || Array.isArray(e["headers"]))) {
+            errors.push({ path: `${pfx}.headers`, message: "must be an object" });
+        }
+    }
+
+    if (errors.length > 0) exitWithConfigErrors(errors, filePath);
+}
+
+function exitWithConfigErrors(errors: ConfigError[], filePath: string): never {
+    console.error(chalk.red(`\nConfig validation failed: ${filePath}`));
+    for (const e of errors) {
+        console.error(chalk.red(`  ${e.path ? `${e.path}: ` : ""}${e.message}`));
+    }
+    process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Config load / apply
+// ---------------------------------------------------------------------------
 
 function loadConfig(path: string): ConfigFile {
     if (!existsSync(path)) {
         console.error(chalk.red(`Config file not found: ${path}`));
         process.exit(1);
     }
+    let raw: unknown;
     try {
-        return JSON.parse(readFileSync(path, "utf-8")) as ConfigFile;
+        raw = JSON.parse(readFileSync(path, "utf-8"));
     } catch (err) {
         console.error(chalk.red(`Invalid JSON in ${path}: ${err instanceof Error ? err.message : String(err)}`));
         process.exit(1);
     }
+    validateConfigFile(raw, path);
+    return raw as ConfigFile;
 }
 
 function applyConfig(wd: WatchDiff, cfg: ConfigFile): void {
@@ -472,40 +569,103 @@ function applyConfig(wd: WatchDiff, cfg: ConfigFile): void {
             changeThreshold:      w.changeThreshold,
             ignoreNumbers:        w.ignoreNumbers,
             alertIfNoChangeAfter: w.alertIfNoChangeAfter,
+            webhookRetries:       w.webhookRetries,
         });
     }
 }
 
+// ---------------------------------------------------------------------------
+// CLI option / env var resolution
+// ---------------------------------------------------------------------------
+
+function isTruthy(val: string): boolean {
+    return ["1", "true", "yes", "on"].includes(val.toLowerCase());
+}
+
 function buildWatchOptions(opts: Record<string, string | boolean | undefined>): WatchOptions {
     const result: WatchOptions = {};
-    if (opts["target"])            result.target            = opts["target"] as string;
-    if (opts["interval"])          result.interval          = parseInt(opts["interval"] as string, 10);
-    if (opts["webhook"])           result.webhooks          = [opts["webhook"] as string];
-    if (opts["browser"])           result.browser           = true;
-    if (opts["proxy"])             result.proxies           = [opts["proxy"] as string];
-    if (opts["userAgent"])         result.userAgents        = [opts["userAgent"] as string];
-    if (opts["diffMode"])          result.diffMode          = opts["diffMode"] as WatchOptions["diffMode"];
-    if (opts["cooldown"])          result.cooldown          = parseInt(opts["cooldown"] as string, 10);
-    if (opts["retries"])           result.retries           = parseInt(opts["retries"] as string, 10);
-    if (opts["jitter"])            result.jitter            = parseFloat(opts["jitter"] as string);
-    if (opts["dryRun"])            result.dryRun            = true;
-    if (opts["maxSnapshots"])      result.maxSnapshots      = parseInt(opts["maxSnapshots"] as string, 10);
-    if (opts["changeThreshold"])   result.changeThreshold   = parseFloat(opts["changeThreshold"] as string);
-    if (opts["ignoreNumbers"])     result.ignoreNumbers     = true;
-    if (opts["alertIfNoChange"])   result.alertIfNoChangeAfter = parseInt(opts["alertIfNoChange"] as string, 10);
+    const env = process.env;
+
+    const str = (key: string, envKey?: string): string | undefined =>
+        (opts[key] as string | undefined) ?? (envKey ? env[envKey] : undefined);
+    const num = (key: string, envKey?: string): number | undefined => {
+        const v = str(key, envKey);
+        return v !== undefined ? parseInt(v, 10) : undefined;
+    };
+    const flt = (key: string, envKey?: string): number | undefined => {
+        const v = str(key, envKey);
+        return v !== undefined ? parseFloat(v) : undefined;
+    };
+    const bool = (key: string, envKey?: string): boolean => {
+        if (opts[key]) return true;
+        const v = envKey ? env[envKey] : undefined;
+        return v ? isTruthy(v) : false;
+    };
+
+    const target = str("target", "WATCHDIFF_TARGET");
+    if (target)                              result.target            = target;
+    const interval = num("interval", "WATCHDIFF_INTERVAL");
+    if (interval !== undefined)              result.interval          = interval;
+    const webhook = str("webhook", "WATCHDIFF_WEBHOOK");
+    if (webhook)                             result.webhooks          = [webhook];
+    if (bool("browser", "WATCHDIFF_BROWSER")) result.browser          = true;
+    const proxy = str("proxy", "WATCHDIFF_PROXY");
+    if (proxy)                               result.proxies           = [proxy];
+    const ua = str("userAgent", "WATCHDIFF_USER_AGENT");
+    if (ua)                                  result.userAgents        = [ua];
+    const diffMode = str("diffMode", "WATCHDIFF_DIFF_MODE");
+    if (diffMode)                            result.diffMode          = diffMode as WatchOptions["diffMode"];
+    const cooldown = num("cooldown", "WATCHDIFF_COOLDOWN");
+    if (cooldown !== undefined)              result.cooldown          = cooldown;
+    const retries = num("retries", "WATCHDIFF_RETRIES");
+    if (retries !== undefined)               result.retries           = retries;
+    const jitter = flt("jitter", "WATCHDIFF_JITTER");
+    if (jitter !== undefined)                result.jitter            = jitter;
+    if (opts["dryRun"])                      result.dryRun            = true;
+    const maxSnap = num("maxSnapshots", "WATCHDIFF_MAX_SNAPSHOTS");
+    if (maxSnap !== undefined)               result.maxSnapshots      = maxSnap;
+    const threshold = flt("changeThreshold", "WATCHDIFF_CHANGE_THRESHOLD");
+    if (threshold !== undefined)             result.changeThreshold   = threshold;
+    if (bool("ignoreNumbers", "WATCHDIFF_IGNORE_NUMBERS")) result.ignoreNumbers = true;
+    const silence = num("alertIfNoChange", "WATCHDIFF_ALERT_IF_NO_CHANGE");
+    if (silence !== undefined)               result.alertIfNoChangeAfter = silence;
+
     return result;
 }
 
-/** Patch console to suppress output based on --quiet / --verbose flags. */
-function applyVerbosity(opts: Record<string, unknown>): void {
-    if (opts["quiet"]) {
-        // Suppress info and debug, keep errors
+// ---------------------------------------------------------------------------
+// Output (verbosity + log format)
+// ---------------------------------------------------------------------------
+
+/** Patch console based on --quiet / --verbose / --log-format flags. */
+function applyOutput(opts: Record<string, unknown>): void {
+    const quiet   = !!opts["quiet"];
+    const verbose = !!opts["verbose"];
+    const fmt     = (opts["logFormat"] as string | undefined) ?? process.env["WATCHDIFF_LOG_FORMAT"];
+
+    if (fmt === "json") {
+        const jsonWriter = (level: string, stderr = false) =>
+            (...args: unknown[]) => {
+                const line = JSON.stringify({
+                    level,
+                    timestamp: new Date().toISOString(),
+                    message:   args.map(String).join(" "),
+                }) + "\n";
+                (stderr ? process.stderr : process.stdout).write(line);
+            };
+        console.log   = jsonWriter("info");
+        console.info  = jsonWriter("info");
+        console.warn  = jsonWriter("warn");
+        console.error = jsonWriter("error", true);
+        console.debug = jsonWriter("debug");
+    }
+
+    if (quiet) {
         console.log   = () => {};
         console.info  = () => {};
         console.warn  = () => {};
         console.debug = () => {};
-    } else if (!opts["verbose"]) {
-        // Default: suppress debug ticks
+    } else if (!verbose) {
         console.debug = () => {};
     }
 }
