@@ -14,7 +14,7 @@ export type ChangeType = "added" | "removed" | "modified" | "unchanged";
 // Configuration
 // ---------------------------------------------------------------------------
 
-export type DiffMode = "line" | "semantic" | "word" | "json";
+export type DiffMode = "line" | "semantic" | "word" | "json" | "rss";
 
 export interface BrowserOptions {
     /** Navigation event to wait for before extracting content (default: "domcontentloaded"). */
@@ -41,6 +41,15 @@ export interface SilenceInfo {
     label: string;
     /** Seconds elapsed since the last detected change (or since monitoring started). */
     secondsSinceLastChange: number;
+}
+
+export interface SpikeInfo {
+    url: string;
+    label: string;
+    /** Number of changes detected inside the spike window. */
+    changesInWindow: number;
+    /** Width of the spike detection window in seconds. */
+    windowSeconds: number;
 }
 
 export interface WatchConfig {
@@ -94,6 +103,16 @@ export interface WatchConfig {
     onSilence?: (info: SilenceInfo) => void;
     /** Number of retry attempts for failed webhook deliveries (default 3). */
     webhookRetries?: number;
+    /** Save the full-page HTML to disk whenever a change is detected. */
+    archiveHtml?: boolean;
+    /** Capture a PNG screenshot on change (requires browser: true). */
+    screenshotOnChange?: boolean;
+    /** Spike detection: time window in seconds to count changes. */
+    changeSpikeWindow?: number;
+    /** Spike detection: alert when this many changes occur inside changeSpikeWindow. */
+    changeSpikeThreshold?: number;
+    /** Called when a change spike is detected. */
+    onSpike?: (info: SpikeInfo) => void;
     alert?: AlertConfig;
 }
 
@@ -127,6 +146,11 @@ export function makeWatchConfig(
         onError:                opts.onError,
         onSilence:              opts.onSilence,
         webhookRetries:         opts.webhookRetries,
+        archiveHtml:            opts.archiveHtml,
+        screenshotOnChange:     opts.screenshotOnChange,
+        changeSpikeWindow:      opts.changeSpikeWindow,
+        changeSpikeThreshold:   opts.changeSpikeThreshold,
+        onSpike:                opts.onSpike,
         alert:                  opts.alert,
     };
 }
@@ -250,6 +274,8 @@ export interface WatcherStatus {
     checksCount: number;
     /** Total number of checks that produced at least one change. */
     changesCount: number;
+    /** Total number of fetch or parse errors since start. */
+    errorsCount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -266,4 +292,6 @@ export interface IStore {
     loadReports(url: string, target: string | undefined, limit?: number): Record<string, unknown>[];
     /** Optional: prune oldest snapshots, keeping only the last `max` entries. */
     pruneSnapshots?(url: string, target: string | undefined, max: number): void;
+    /** Optional: return the base storage directory (used for HTML/screenshot archiving). */
+    getDirectory?(): string;
 }

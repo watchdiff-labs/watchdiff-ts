@@ -53,6 +53,8 @@ export class Store implements IStore {
         if (existsSync(path)) unlinkSync(path);
     }
 
+    getDirectory(): string { return this.dir; }
+
     pruneSnapshots(url: string, target: string | undefined, max: number): void {
         const path    = this.snapshotPath(url, target);
         const history = this.loadRaw(path);

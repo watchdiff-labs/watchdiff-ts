@@ -19,6 +19,7 @@ import {
     type DiffReport,
     type IStore,
     type SilenceInfo,
+    type SpikeInfo,
     type Snapshot,
     type WatchConfig,
     type WatcherStatus,
@@ -26,6 +27,7 @@ import {
 import { Scheduler } from "./scheduler/index.js";
 import { Store } from "./store/index.js";
 import { Exporter } from "./exporter/index.js";
+import { StatusServer } from "./status-server/index.js";
 
 export interface WatchOptions {
     /** CSS selector or XPath expression - undefined = full page. */
@@ -82,6 +84,16 @@ export interface WatchOptions {
     onSilence?: (info: SilenceInfo) => void;
     /** Number of retry attempts for failed webhook deliveries (default 3, 0 = no retry). */
     webhookRetries?: number;
+    /** Save the full-page HTML to disk whenever a change is detected. */
+    archiveHtml?: boolean;
+    /** Capture a PNG screenshot on change (requires browser: true). */
+    screenshotOnChange?: boolean;
+    /** Spike detection: time window in seconds to count changes. */
+    changeSpikeWindow?: number;
+    /** Spike detection: alert when this many changes occur inside changeSpikeWindow. */
+    changeSpikeThreshold?: number;
+    /** Called when a change spike is detected. */
+    onSpike?: (info: SpikeInfo) => void;
 }
 
 export class WatchDiff {
@@ -90,6 +102,7 @@ export class WatchDiff {
     private readonly globalCallbacks: Array<(report: DiffReport) => void | Promise<void>> = [];
     private scheduler: Scheduler | null                                                  = null;
     private stopFn: (() => void) | null                                                  = null;
+    private statusServer: StatusServer | null                                            = null;
 
     /**
      * @param storageDir - Directory for JSON storage (default ".watchdiff").
@@ -149,6 +162,11 @@ export class WatchDiff {
                 alertIfNoChangeAfter: opts.alertIfNoChangeAfter,
                 onError:              opts.onError,
                 onSilence:            opts.onSilence,
+                archiveHtml:          opts.archiveHtml,
+                screenshotOnChange:   opts.screenshotOnChange,
+                changeSpikeWindow:    opts.changeSpikeWindow,
+                changeSpikeThreshold: opts.changeSpikeThreshold,
+                onSpike:              opts.onSpike,
                 alert,
             })
         );
@@ -248,6 +266,7 @@ export class WatchDiff {
                 lastChangeAt: null,
                 checksCount:  0,
                 changesCount: 0,
+                errorsCount:  0,
             }));
         }
         return this.scheduler.getStatuses(this.configs);
@@ -312,6 +331,63 @@ export class WatchDiff {
         const config   = this.findConfig(url);
         const exporter = new Exporter(this.store);
         return exporter.snapshotsToXlsx(config.url, config.target, limit);
+    }
+
+    // ------------------------------------------------------------------
+    // Status server
+    // ------------------------------------------------------------------
+
+    /**
+     * Start a built-in HTTP status server.
+     * Endpoints: GET /health, /status, /metrics (Prometheus).
+     */
+    startStatusServer(port = 9090): void {
+        if (this.statusServer) {
+            console.warn("[watchdiff] Status server already running.");
+            return;
+        }
+        this.statusServer = new StatusServer();
+        this.statusServer.start(port, () => this.status());
+    }
+
+    stopStatusServer(): void {
+        this.statusServer?.stop();
+        this.statusServer = null;
+    }
+
+    // ------------------------------------------------------------------
+    // Compare two URLs (one-shot)
+    // ------------------------------------------------------------------
+
+    /**
+     * Fetch and diff two arbitrary URLs without any persistent storage.
+     * Uses dynamic imports to load internal modules lazily.
+     */
+    async compareUrls(urlA: string, urlB: string, opts: WatchOptions = {}): Promise<DiffReport> {
+        const { Fetcher }     = await import("./fetcher/index.js");
+        const { BrowserFetcher } = await import("./fetcher/browser.js");
+        const { Cleaner }     = await import("./cleaner/index.js");
+        const { Parser }      = await import("./parser/index.js");
+        const { DiffEngine }  = await import("./diff/index.js");
+
+        const configA = makeWatchConfig(urlA, opts as Partial<Omit<WatchConfig, "url">>);
+        const configB = makeWatchConfig(urlB, opts as Partial<Omit<WatchConfig, "url">>);
+
+        const fetcher        = configA.browser ? new BrowserFetcher() : new Fetcher();
+        const cleaner        = new Cleaner({ extraSelectors: configA.ignoreSelectors, extraPatterns: configA.ignorePatterns });
+        const parser         = new Parser();
+        const engine         = new DiffEngine();
+
+        const htmlA = await (fetcher as { fetch(c: WatchConfig): Promise<string> }).fetch(configA);
+        const htmlB = await (fetcher as { fetch(c: WatchConfig): Promise<string> }).fetch(configB);
+
+        const $A = cleaner.clean(htmlA);
+        const $B = cleaner.clean(htmlB);
+
+        const snapA = parser.extract($A, configA);
+        const snapB = parser.extract($B, configB);
+
+        return engine.compare(snapA, snapB, configA);
     }
 
     // ------------------------------------------------------------------

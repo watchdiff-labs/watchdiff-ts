@@ -8,7 +8,7 @@ import type { WatchOptions } from "../core.js";
 program
     .name("watchdiff")
     .description("Lightweight web change monitoring - clean diffs, no AI required.")
-    .version("0.1.4");
+    .version("0.1.5");
 
 // ---------------------------------------------------------------------------
 // run
@@ -25,7 +25,7 @@ program
     .option("--browser",                  "Use headless Playwright browser for JS-heavy pages (env: WATCHDIFF_BROWSER)")
     .option("--proxy <url>",              "Proxy URL (e.g. http://user:pass@host:port)")
     .option("--user-agent <ua>",          "Custom User-Agent string")
-    .option("--diff-mode <mode>",         "Diff mode: 'line' (default), 'semantic', 'word', or 'json' (env: WATCHDIFF_DIFF_MODE)")
+    .option("--diff-mode <mode>",         "Diff mode: 'line' (default), 'semantic', 'word', 'json', or 'rss' (env: WATCHDIFF_DIFF_MODE)")
     .option("--cooldown <seconds>",       "Minimum seconds between two alerts for the same URL (env: WATCHDIFF_COOLDOWN)")
     .option("--retries <n>",              "Number of fetch retries on error (env: WATCHDIFF_RETRIES)")
     .option("--jitter <factor>",          "Interval jitter 0-1, e.g. 0.2 = ±20% variance (env: WATCHDIFF_JITTER)")
@@ -34,6 +34,11 @@ program
     .option("--change-threshold <ratio>", "Minimum fraction 0-1 of content that must change to alert")
     .option("--ignore-numbers",           "Ignore standalone number changes (counters, dates)")
     .option("--alert-if-no-change <sec>", "Fire silence alert after N seconds without a change")
+    .option("--archive-html",             "Save full-page HTML to disk on every change")
+    .option("--screenshot",               "Capture PNG screenshot on change (requires --browser)")
+    .option("--spike-window <sec>",       "Spike detection time window in seconds")
+    .option("--spike-threshold <n>",      "Alert when N changes occur inside the spike window")
+    .option("--status-port <port>",       "Start HTTP status server on this port (/health /status /metrics)")
     .option("--log-format <format>",      "Log format: 'text' (default) or 'json' (env: WATCHDIFF_LOG_FORMAT)")
     .option("-q, --quiet",                "Suppress all output except errors")
     .option("-v, --verbose",              "Show debug output (no-change ticks, cooldown skips, etc.)")
@@ -70,13 +75,61 @@ program
             });
         }
 
+        const statusPort = opts["statusPort"] !== undefined ? parseInt(opts["statusPort"] as string, 10) : undefined;
+        if (statusPort) {
+            wd.startStatusServer(statusPort);
+        }
+
         const stop = wd.start();
 
         process.on("SIGINT", () => {
             if (!opts["quiet"]) console.log(chalk.gray("\nStopping..."));
+            wd.stopStatusServer();
             stop();
             process.exit(0);
         });
+    });
+
+// ---------------------------------------------------------------------------
+// compare
+// ---------------------------------------------------------------------------
+
+program
+    .command("compare <urlA> <urlB>")
+    .description("Fetch and diff two URLs on the spot (no storage needed)")
+    .option("-t, --target <selector>", "CSS selector or XPath expression")
+    .option("--browser",               "Use headless Playwright browser")
+    .option("--diff-mode <mode>",      "Diff mode: line, semantic, word, json, or rss")
+    .option("--json",                  "Output raw JSON")
+    .option("-q, --quiet",             "Suppress all output except errors")
+    .action(async (urlA: string, urlB: string, opts: Record<string, string | boolean | undefined>) => {
+        applyOutput(opts);
+        const wd = new WatchDiff();
+        try {
+            const report = await wd.compareUrls(urlA, urlB, buildWatchOptions(opts));
+
+            if (opts["json"]) {
+                console.log(JSON.stringify(report, null, 2));
+                return;
+            }
+
+            if (!opts["quiet"]) {
+                if (report.changes.length === 0) {
+                    console.log(chalk.green("No differences found."));
+                } else {
+                    console.log(chalk.bold(`\n${report.changes.length} difference(s) between the two URLs\n`));
+                    for (const change of report.changes) {
+                        const line = "  " + changeHuman(change);
+                        if (change.kind === "added")        console.log(chalk.green(line));
+                        else if (change.kind === "removed")  console.log(chalk.red(line));
+                        else                                 console.log(chalk.yellow(line));
+                    }
+                }
+            }
+        } catch (err) {
+            console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+            process.exit(1);
+        }
     });
 
 // ---------------------------------------------------------------------------
@@ -435,6 +488,10 @@ interface ConfigFile {
         ignoreNumbers?:        boolean;
         alertIfNoChangeAfter?: number;
         webhookRetries?:       number;
+        archiveHtml?:          boolean;
+        screenshotOnChange?:   boolean;
+        changeSpikeWindow?:    number;
+        changeSpikeThreshold?: number;
     }>;
 }
 
@@ -442,7 +499,7 @@ interface ConfigFile {
 // Config validation
 // ---------------------------------------------------------------------------
 
-const VALID_DIFF_MODES = new Set(["line", "semantic", "word", "json"]);
+const VALID_DIFF_MODES = new Set(["line", "semantic", "word", "json", "rss"]);
 
 interface ConfigError { path: string; message: string; }
 
@@ -570,6 +627,10 @@ function applyConfig(wd: WatchDiff, cfg: ConfigFile): void {
             ignoreNumbers:        w.ignoreNumbers,
             alertIfNoChangeAfter: w.alertIfNoChangeAfter,
             webhookRetries:       w.webhookRetries,
+            archiveHtml:          w.archiveHtml,
+            screenshotOnChange:   w.screenshotOnChange,
+            changeSpikeWindow:    w.changeSpikeWindow,
+            changeSpikeThreshold: w.changeSpikeThreshold,
         });
     }
 }
@@ -629,6 +690,12 @@ function buildWatchOptions(opts: Record<string, string | boolean | undefined>): 
     if (bool("ignoreNumbers", "WATCHDIFF_IGNORE_NUMBERS")) result.ignoreNumbers = true;
     const silence = num("alertIfNoChange", "WATCHDIFF_ALERT_IF_NO_CHANGE");
     if (silence !== undefined)               result.alertIfNoChangeAfter = silence;
+    if (bool("archiveHtml", "WATCHDIFF_ARCHIVE_HTML")) result.archiveHtml = true;
+    if (bool("screenshot", "WATCHDIFF_SCREENSHOT"))    result.screenshotOnChange = true;
+    const spikeWindow = num("spikeWindow", "WATCHDIFF_SPIKE_WINDOW");
+    if (spikeWindow !== undefined)           result.changeSpikeWindow    = spikeWindow;
+    const spikeThreshold = num("spikeThreshold", "WATCHDIFF_SPIKE_THRESHOLD");
+    if (spikeThreshold !== undefined)        result.changeSpikeThreshold = spikeThreshold;
 
     return result;
 }

@@ -9,6 +9,7 @@
  */
 
 import * as cheerio from "cheerio";
+import { DOMParser } from "@xmldom/xmldom";
 import { diffLines, diffArrays, diffWords } from "diff";
 import type { Change, DiffReport, Snapshot, WatchConfig } from "../models.js";
 import { reportHasChanges, snapshotsIdentical } from "../models.js";
@@ -39,6 +40,7 @@ export class DiffEngine {
             case "semantic": return this.compareSemanticBlocks(before, after, report);
             case "word":     return this.compareWords(before, after, report);
             case "json":     return this.compareJson(before, after, report);
+            case "rss":      return this.compareRss(before, after, report);
             default:         return this.compareLines(before, after, report);
         }
     }
@@ -118,6 +120,43 @@ export class DiffEngine {
         }
 
         report.changes = coalescePairs(report.changes);
+        return report;
+    }
+
+    // ------------------------------------------------------------------
+    // RSS / Atom diff
+    // ------------------------------------------------------------------
+
+    private compareRss(before: Snapshot, after: Snapshot, report: DiffReport): DiffReport {
+        const beforeItems = parseRssItems(before.rawHtml || before.content);
+        const afterItems  = parseRssItems(after.rawHtml  || after.content);
+
+        if (beforeItems.length === 0 && afterItems.length === 0) {
+            return this.compareLines(before, after, report);
+        }
+
+        const beforeById = new Map(beforeItems.map((i) => [i.id, i]));
+        const afterById  = new Map(afterItems.map((i)  => [i.id, i]));
+
+        for (const item of afterItems) {
+            if (!beforeById.has(item.id)) {
+                report.changes.push({ kind: "added", after: item.title, context: item.link || item.id });
+            }
+        }
+
+        for (const item of beforeItems) {
+            if (!afterById.has(item.id)) {
+                report.changes.push({ kind: "removed", before: item.title, context: item.link || item.id });
+            }
+        }
+
+        for (const afterItem of afterItems) {
+            const beforeItem = beforeById.get(afterItem.id);
+            if (beforeItem && beforeItem.title !== afterItem.title) {
+                report.changes.push({ kind: "modified", before: beforeItem.title, after: afterItem.title, context: afterItem.link || afterItem.id });
+            }
+        }
+
         return report;
     }
 
@@ -227,6 +266,56 @@ function extractSemanticBlocks(html: string): string[] | null {
     });
 
     return blocks.length > 0 ? blocks : null;
+}
+
+// ---------------------------------------------------------------------------
+// RSS / Atom helpers
+// ---------------------------------------------------------------------------
+
+// Minimal duck-type to avoid collision between @xmldom/xmldom.Element and lib.dom Element.
+interface XmlNode {
+    getElementsByTagName(tag: string): { length: number; [i: number]: XmlNode | undefined };
+    textContent: string | null;
+    getAttribute?(name: string): string | null;
+}
+
+interface RssItem { id: string; title: string; link: string; }
+
+function parseRssItems(xml: string): RssItem[] {
+    try {
+        const doc = new DOMParser().parseFromString(xml, "text/xml") as unknown as XmlNode;
+
+        const itemNodes = doc.getElementsByTagName("item");
+        if (itemNodes.length > 0) {
+            return Array.from({ length: itemNodes.length }, (_, i) => {
+                const el   = itemNodes[i]!;
+                const title = xmlText(el, "title");
+                const link  = xmlText(el, "link");
+                const id    = xmlText(el, "guid") || link || title;
+                return { id, title, link };
+            });
+        }
+
+        const entryNodes = doc.getElementsByTagName("entry");
+        if (entryNodes.length > 0) {
+            return Array.from({ length: entryNodes.length }, (_, i) => {
+                const el    = entryNodes[i]!;
+                const title = xmlText(el, "title");
+                const id    = xmlText(el, "id");
+                const linkNodes = el.getElementsByTagName("link");
+                const linkEl    = linkNodes[0];
+                const link  = linkEl?.getAttribute?.("href") ?? xmlText(el, "link");
+                return { id: id || link || title, title, link };
+            });
+        }
+    } catch {
+        // not a parseable feed
+    }
+    return [];
+}
+
+function xmlText(el: XmlNode, tag: string): string {
+    return el.getElementsByTagName(tag)[0]?.textContent?.trim() ?? "";
 }
 
 /**

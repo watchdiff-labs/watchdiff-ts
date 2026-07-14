@@ -15,6 +15,7 @@ type ChromiumType = {
             goto(url: string, opts: Record<string, unknown>): Promise<void>;
             waitForSelector(selector: string, opts: Record<string, unknown>): Promise<void>;
             content(): Promise<string>;
+            screenshot(opts?: Record<string, unknown>): Promise<Buffer>;
         }>;
         close(): Promise<void>;
     }>;
@@ -85,9 +86,28 @@ export class BrowserFetcher {
         }
     }
 
+    async screenshot(config: WatchConfig): Promise<Buffer> {
+        const chromium = await this.loadChromium();
+        const opts     = config.browserOptions ?? {};
+        const browser  = await chromium.launch({ headless: true });
+        try {
+            const page = await browser.newPage();
+            await page.goto(config.url, {
+                timeout:   config.timeout,
+                waitUntil: opts.waitFor ?? "domcontentloaded",
+            });
+            if (opts.waitForSelector) {
+                await page.waitForSelector(opts.waitForSelector, { timeout: config.timeout });
+            }
+            return await page.screenshot({ type: "png", fullPage: true });
+        } finally {
+            await browser.close();
+        }
+    }
+
     private async loadChromium(): Promise<ChromiumType> {
         try {
-            const pw = await import("playwright") as { chromium: ChromiumType };
+            const pw = await import("playwright") as unknown as { chromium: ChromiumType };
             return pw.chromium;
         } catch {
             throw new FetchError(

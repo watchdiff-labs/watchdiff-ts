@@ -34,6 +34,7 @@ export type {
     Change,
     DiffReport,
     SilenceInfo,
+    SpikeInfo,
     WatcherStatus,
 } from "./models.js";
 
@@ -48,3 +49,4 @@ export { Notifier } from "./notifier/index.js";
 export { Scheduler } from "./scheduler/index.js";
 export { Exporter } from "./exporter/index.js";
 export type { ExportFormat, ExportType } from "./exporter/index.js";
+export { StatusServer } from "./status-server/index.js";

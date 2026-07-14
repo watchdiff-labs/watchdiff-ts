@@ -8,6 +8,9 @@
  *   Fetcher/BrowserFetcher - Cleaner - Parser - DiffEngine - Store - Notifier
  */
 
+import { writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { Cleaner } from "../cleaner/index.js";
 import { DiffEngine } from "../diff/index.js";
 import { FetchError, Fetcher } from "../fetcher/index.js";
@@ -18,6 +21,7 @@ import {
     type DiffReport,
     type IStore,
     type SilenceInfo,
+    type SpikeInfo,
     type WatchConfig,
     type WatcherStatus,
 } from "../models.js";
@@ -28,16 +32,17 @@ export type GlobalCallback = (report: DiffReport) => void | Promise<void>;
 
 // Per-URL runtime state
 interface UrlState {
-    lastCheckAt:    Date | null;
-    nextCheckAt:    Date | null;
-    lastChangeAt:   Date | null;
-    checksCount:    number;
-    changesCount:   number;
-    paused:         boolean;
-    // Tracks last alert timestamp for cooldown enforcement
-    lastAlertAt:    number;
-    // Tracks last silence alert timestamp to avoid repeated silence alerts
-    lastSilenceAt:  number;
+    lastCheckAt:       Date | null;
+    nextCheckAt:       Date | null;
+    lastChangeAt:      Date | null;
+    checksCount:       number;
+    changesCount:      number;
+    errorsCount:       number;
+    paused:            boolean;
+    lastAlertAt:       number;
+    lastSilenceAt:     number;
+    recentChangeTimes: number[];
+    lastSpikeAt:       number;
 }
 
 const NUMBERS_PATTERN = /\b\d+(\.\d+)?\b/g;
@@ -141,6 +146,7 @@ export class Scheduler {
                 lastChangeAt: state.lastChangeAt,
                 checksCount:  state.checksCount,
                 changesCount: state.changesCount,
+                errorsCount:  state.errorsCount,
             };
         });
     }
@@ -157,14 +163,17 @@ export class Scheduler {
 
     private makeEmptyState(): UrlState {
         return {
-            lastCheckAt:   null,
-            nextCheckAt:   null,
-            lastChangeAt:  null,
-            checksCount:   0,
-            changesCount:  0,
-            paused:        false,
-            lastAlertAt:   0,
-            lastSilenceAt: 0,
+            lastCheckAt:       null,
+            nextCheckAt:       null,
+            lastChangeAt:      null,
+            checksCount:       0,
+            changesCount:      0,
+            errorsCount:       0,
+            paused:            false,
+            lastAlertAt:       0,
+            lastSilenceAt:     0,
+            recentChangeTimes: [],
+            lastSpikeAt:       0,
         };
     }
 
@@ -196,6 +205,7 @@ export class Scheduler {
                 ? await this.browserFetcher.fetch(config)
                 : await this.fetcher.fetch(config);
         } catch (err) {
+            state.errorsCount++;
             const error = err instanceof Error ? err : new Error(String(err));
             if (config.onError) {
                 config.onError(error, config);
@@ -222,6 +232,7 @@ export class Scheduler {
         try {
             snapshot = this.parser.extract($, config);
         } catch (err) {
+            state.errorsCount++;
             const error = err instanceof Error ? err : new Error(String(err));
             if (config.onError) {
                 config.onError(error, config);
@@ -276,6 +287,60 @@ export class Scheduler {
                 if (changedLen / totalLen < config.changeThreshold) {
                     console.debug(`[${config.label}] Change below threshold (${(changedLen / totalLen * 100).toFixed(1)}% < ${(config.changeThreshold * 100).toFixed(1)}%) - suppressed.`);
                     return report;
+                }
+            }
+
+            // Spike detection
+            if (config.changeSpikeWindow && config.changeSpikeThreshold) {
+                const windowMs = config.changeSpikeWindow * 1000;
+                state.recentChangeTimes = state.recentChangeTimes.filter((t) => now - t < windowMs);
+                state.recentChangeTimes.push(now);
+                if (
+                    state.recentChangeTimes.length >= config.changeSpikeThreshold &&
+                    now - state.lastSpikeAt > windowMs
+                ) {
+                    state.lastSpikeAt = now;
+                    const info: SpikeInfo = {
+                        url:              config.url,
+                        label:            config.label,
+                        changesInWindow:  state.recentChangeTimes.length,
+                        windowSeconds:    config.changeSpikeWindow,
+                    };
+                    console.warn(`[${config.label}] Change spike: ${info.changesInWindow} changes in ${info.windowSeconds}s`);
+                    if (config.onSpike) {
+                        try { config.onSpike(info); } catch (err) {
+                            console.warn("[watchdiff] onSpike callback error:", err);
+                        }
+                    }
+                }
+            }
+
+            // HTML archive
+            if (config.archiveHtml && !config.dryRun) {
+                const storeDir   = this.store.getDirectory?.() ?? ".watchdiff";
+                const archiveDir = join(storeDir, "archive");
+                mkdirSync(archiveDir, { recursive: true });
+                const urlHash    = createHash("md5").update(config.url).digest("hex").slice(0, 8);
+                const ts         = new Date().toISOString().replace(/[:.]/g, "-");
+                const archivePath = join(archiveDir, `${urlHash}_${ts}.html`);
+                writeFileSync(archivePath, snapshot.rawHtml || html, "utf-8");
+                console.debug(`[${config.label}] HTML archived: ${archivePath}`);
+            }
+
+            // Screenshot on change
+            if (config.screenshotOnChange && config.browser && !config.dryRun) {
+                try {
+                    const storeDir      = this.store.getDirectory?.() ?? ".watchdiff";
+                    const archiveDir    = join(storeDir, "archive");
+                    mkdirSync(archiveDir, { recursive: true });
+                    const urlHash       = createHash("md5").update(config.url).digest("hex").slice(0, 8);
+                    const ts            = new Date().toISOString().replace(/[:.]/g, "-");
+                    const screenshotPath = join(archiveDir, `${urlHash}_${ts}.png`);
+                    const buf = await this.browserFetcher.screenshot(config);
+                    writeFileSync(screenshotPath, buf);
+                    console.debug(`[${config.label}] Screenshot saved: ${screenshotPath}`);
+                } catch (err) {
+                    console.warn(`[${config.label}] Screenshot failed:`, err instanceof Error ? err.message : String(err));
                 }
             }
 
