@@ -3,12 +3,13 @@ import chalk from "chalk";
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { WatchDiff } from "../index.js";
 import { changeHuman, reportSummary } from "../models.js";
-import type { WatchOptions } from "../core.js";
+import { dbReportSummary } from "../db-models.js";
+import type { WatchOptions, DbWatchOptions } from "../core.js";
 
 program
     .name("watchdiff")
     .description("Lightweight web change monitoring - clean diffs, no AI required.")
-    .version("0.1.6");
+    .version("0.2.0");
 
 // ---------------------------------------------------------------------------
 // run
@@ -408,6 +409,123 @@ program
             console.error(chalk.red(`Unknown format: ${format}. Use 'csv' or 'xlsx'.`));
             process.exit(1);
         }
+    });
+
+// ---------------------------------------------------------------------------
+// db
+// ---------------------------------------------------------------------------
+
+program
+    .command("db <connectionString> <table>")
+    .description(
+        "Monitor a database table for changes.\n" +
+        "  Connection string formats:\n" +
+        "    sqlite://./path/to/db.sqlite\n" +
+        "    postgresql://user:pass@host:5432/dbname\n" +
+        "    mysql://user:pass@host:3306/dbname"
+    )
+    .option("-i, --interval <seconds>",      "Seconds between checks (default 300)")
+    .option("-w, --webhook <url>",           "Webhook URL to POST on change")
+    .option("-s, --storage <dir>",           "Storage directory", ".watchdiff")
+    .option("--diff-mode <mode>",            "row (default) | schema | aggregate | value")
+    .option("--primary-key <cols>",          "Comma-separated primary key column(s)")
+    .option("--ignore-columns <cols>",       "Comma-separated columns to skip")
+    .option("--label <label>",               "Human-readable label")
+    .option("--query <sql>",                 "Custom SELECT query (overrides default SELECT *)")
+    .option("--threshold <pct>",             "Alert threshold % for aggregate mode (default 0)")
+    .option("--cooldown <seconds>",          "Min seconds between consecutive alerts")
+    .option("--dry-run",                     "Fetch and diff without saving or alerting")
+    .option("--max-snapshots <n>",           "Keep only the last N snapshots")
+    .option("--no-insert",                   "Suppress insert alerts")
+    .option("--no-delete",                   "Suppress delete alerts")
+    .option("--no-update",                   "Suppress update alerts")
+    .option("--json",                        "Output raw JSON on each change")
+    .option("-q, --quiet",                   "Suppress all output except errors")
+    .action(async (
+        connectionString: string,
+        table: string,
+        opts: Record<string, string | boolean | undefined>
+    ) => {
+        applyOutput(opts);
+
+        const storage = (opts["storage"] as string | undefined) ?? process.env["WATCHDIFF_STORAGE"] ?? ".watchdiff";
+        const wd      = new WatchDiff(storage);
+
+        const dbOpts: DbWatchOptions = {};
+
+        const interval = opts["interval"] ? parseInt(opts["interval"] as string, 10) : undefined;
+        if (interval !== undefined) dbOpts.interval = interval;
+
+        const webhook = opts["webhook"] as string | undefined;
+        if (webhook) dbOpts.webhooks = [webhook];
+
+        const diffMode = opts["diffMode"] as string | undefined;
+        if (diffMode) dbOpts.diffMode = diffMode as DbWatchOptions["diffMode"];
+
+        const primaryKey = opts["primaryKey"] as string | undefined;
+        if (primaryKey) dbOpts.primaryKey = primaryKey.split(",").map((s) => s.trim());
+
+        const ignoreColumns = opts["ignoreColumns"] as string | undefined;
+        if (ignoreColumns) dbOpts.ignoreColumns = ignoreColumns.split(",").map((s) => s.trim());
+
+        const label = opts["label"] as string | undefined;
+        if (label) dbOpts.label = label;
+
+        const query = opts["query"] as string | undefined;
+        if (query) dbOpts.query = query;
+
+        const threshold = opts["threshold"] ? parseFloat(opts["threshold"] as string) : undefined;
+        if (threshold !== undefined) dbOpts.threshold = threshold;
+
+        const cooldown = opts["cooldown"] ? parseInt(opts["cooldown"] as string, 10) : undefined;
+        if (cooldown !== undefined) dbOpts.cooldown = cooldown;
+
+        if (opts["dryRun"])    dbOpts.dryRun        = true;
+        if (opts["insert"] === false) dbOpts.alertOnInsert = false;
+        if (opts["delete"] === false) dbOpts.alertOnDelete = false;
+        if (opts["update"] === false) dbOpts.alertOnUpdate = false;
+
+        const maxSnap = opts["maxSnapshots"] ? parseInt(opts["maxSnapshots"] as string, 10) : undefined;
+        if (maxSnap !== undefined) dbOpts.maxSnapshots = maxSnap;
+
+        if (!opts["quiet"]) {
+            dbOpts.onChange = (report) => {
+                if (opts["json"]) {
+                    console.log(JSON.stringify(report, null, 2));
+                    return;
+                }
+                console.log(chalk.yellow(`\n${dbReportSummary(report)}`));
+                for (const change of report.changes) {
+                    const key  = change.rowKey ? chalk.gray(` [key: ${change.rowKey}]`) : "";
+                    if (change.kind === "inserted") {
+                        console.log(chalk.green(`  [+] inserted${key}`));
+                    } else if (change.kind === "deleted") {
+                        console.log(chalk.red(`  [-] deleted${key}`));
+                    } else if (change.kind === "updated") {
+                        console.log(chalk.yellow(`  [~] updated${key}`));
+                        for (const mod of change.modifications ?? []) {
+                            console.log(chalk.yellow(`      ${mod.column}: ${JSON.stringify(mod.before)} → ${JSON.stringify(mod.after)}`));
+                        }
+                    } else if (change.kind === "schema_changed") {
+                        console.log(chalk.magenta(`  [schema] ${change.column ?? ""}: ${change.context ?? ""}`));
+                    } else if (change.kind === "threshold_exceeded") {
+                        console.log(chalk.red(`  [threshold] ${change.context ?? ""}`));
+                    } else if (change.kind === "value_changed") {
+                        console.log(chalk.yellow(`  [value] ${JSON.stringify(change.before)} → ${JSON.stringify(change.after)}`));
+                    }
+                }
+            };
+        }
+
+        wd.watchDb(connectionString, table, dbOpts);
+
+        const stop = wd.start();
+
+        process.on("SIGINT", () => {
+            if (!opts["quiet"]) console.log(chalk.gray("\nStopping..."));
+            stop();
+            process.exit(0);
+        });
     });
 
 // ---------------------------------------------------------------------------

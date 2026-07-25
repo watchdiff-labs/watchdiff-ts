@@ -15,6 +15,7 @@ No noisy HTML diffs. No external services. No AI black boxes.
 - **HTML archiving** - save full page HTML to disk on every change
 - **Screenshot on change** - capture a PNG via Playwright on every detected change
 - **HTTP status monitoring** - alert when a URL returns a different status code (200 → 503, 503 → 200)
+- **Database monitoring** - watch SQLite, PostgreSQL, or MySQL tables for row inserts, deletes, updates, and schema changes
 - **Change spike detection** - alert when a page changes too frequently in a time window
 - **URL comparison** - diff two arbitrary URLs in a single command
 - **Built-in status server** - HTTP endpoints `/health`, `/status`, `/metrics` (Prometheus)
@@ -64,6 +65,9 @@ No noisy HTML diffs. No external services. No AI black boxes.
 | Screenshot on change | `screenshotOnChange: true` (requires `browser: true`) |
 | Detect change spikes | `changeSpikeWindow: 300, changeSpikeThreshold: 5` |
 | Monitor HTTP status | `alertOnStatusChange: true` + `onStatusChange: (info) => ...` |
+| Monitor a DB table | `.watchDb("sqlite://./app.db", "products", { diffMode: "row" })` |
+| Monitor DB schema | `.watchDb(connStr, "users", { diffMode: "schema" })` |
+| Monitor a DB aggregate | `.watchDb(connStr, "orders", { diffMode: "aggregate", query: "SELECT COUNT(*) FROM orders", threshold: 10 })` |
 | Diff two URLs | `wd.compareUrls(urlA, urlB)` or `watchdiff compare <urlA> <urlB>` |
 | Expose status over HTTP | `wd.startStatusServer(9090)` or `--status-port 9090` |
 | CLI one-liner | `watchdiff run https://example.com --target .price --interval 60` |
@@ -99,6 +103,7 @@ No noisy HTML diffs. No external services. No AI black boxes.
   - [Screenshot on change](#screenshot-on-change)
   - [Change spike detection](#change-spike-detection)
   - [HTTP status monitoring](#http-status-monitoring)
+  - [Database monitoring](#database-monitoring)
   - [RSS / Atom monitoring](#rss--atom-monitoring)
   - [URL comparison](#url-comparison)
   - [Status server](#status-server)
@@ -133,6 +138,8 @@ npm install watchdiff-core
 
 ## Quick start
 
+### Web page monitoring
+
 ```typescript
 import { WatchDiff } from "watchdiff-core";
 
@@ -150,10 +157,44 @@ const stop = wd.start();
 process.on("SIGINT", () => { stop(); process.exit(0); });
 ```
 
+### Database monitoring
+
+```typescript
+import { WatchDiff } from "watchdiff-core";
+
+const wd = new WatchDiff();
+
+// Watch a SQLite table for row-level changes (requires: npm install better-sqlite3)
+wd.watchDb("sqlite://./app.db", "products", {
+  primaryKey: ["id"],
+  ignoreColumns: ["updated_at"],
+  interval: 30,
+  onChange: (report) => {
+    for (const c of report.changes) {
+      if (c.kind === "inserted") console.log("New product:", c.row);
+      if (c.kind === "deleted")  console.log("Deleted:", c.row);
+      if (c.kind === "updated")  console.log("Updated key", c.rowKey, c.modifications);
+    }
+  },
+});
+
+// Also monitor a PostgreSQL table (requires: npm install pg)
+wd.watchDb("postgresql://user:pass@localhost/mydb", "users", {
+  diffMode: "schema",
+  onSchemaChange: (info) => console.log("Schema changed:", info.changes),
+});
+
+const stop = wd.start();
+
+process.on("SIGINT", () => { stop(); process.exit(0); });
+```
+
 
 ## How it works
 
-Every check runs through a fixed pipeline:
+### Web pipeline
+
+Every web check runs through a fixed pipeline:
 
 ```
 Fetcher / BrowserFetcher -> Cleaner -> Parser -> DiffEngine -> Store -> Notifier
@@ -166,6 +207,19 @@ Fetcher / BrowserFetcher -> Cleaner -> Parser -> DiffEngine -> Store -> Notifier
 5. **DiffEngine** - compares content in line, word, semantic, or JSON mode
 6. **Store** - persists snapshots and reports as JSON files or SQLite
 7. **Notifier** - fires callbacks and webhooks on detected changes
+
+### Database pipeline
+
+Every database check runs through a parallel pipeline:
+
+```
+DbFetcher (SQLite / PostgreSQL / MySQL) -> DbDiffEngine -> Store -> callbacks / webhooks
+```
+
+1. **DbFetcher** - executes `SELECT * FROM <table>` (or a custom query) via the appropriate driver adapter
+2. **DbDiffEngine** - compares snapshots in one of four modes: `row`, `schema`, `aggregate`, or `value`
+3. **Store** - serialises the row snapshot to JSON and saves it via the existing `IStore` interface
+4. **Dispatch** - fires `onChange`, `onSchemaChange`, `onThreshold` callbacks and webhooks on detected changes
 
 
 ## API
@@ -342,6 +396,89 @@ const report = await wd.compareUrls(
   { target: ".content", diffMode: "word" }
 );
 console.log(report.changes.length, "difference(s)");
+```
+
+
+### `.watchDb(connectionString, table, options?)` - chainable
+
+Register a database table to monitor. Returns `this` for chaining.
+
+**Supported connection strings:**
+
+```
+sqlite://./path/to/db.sqlite
+postgresql://user:pass@host:5432/dbname
+mysql://user:pass@host:3306/dbname
+```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `diffMode` | `"row" \| "schema" \| "aggregate" \| "value"` | `"row"` | Diff strategy |
+| `primaryKey` | `string[]` | first column | Column(s) that identify a row across snapshots |
+| `ignoreColumns` | `string[]` | `[]` | Columns to exclude from comparison |
+| `query` | `string` | `SELECT * FROM <table>` | Custom SELECT query |
+| `interval` | `number` | `300` | Seconds between checks |
+| `label` | `string` | auto | Human-readable name in logs |
+| `alertOnInsert` | `boolean` | `true` | Alert when rows are inserted |
+| `alertOnDelete` | `boolean` | `true` | Alert when rows are deleted |
+| `alertOnUpdate` | `boolean` | `true` | Alert when rows are updated |
+| `threshold` | `number` | `0` | For `aggregate` mode: alert when value changes by ≥ this % |
+| `onChange` | `fn` | - | Callback receiving a `DbDiffReport` on each change |
+| `onSchemaChange` | `fn` | - | Called specifically when column definitions change |
+| `onThreshold` | `fn` | - | Called when an aggregate threshold is exceeded |
+| `onError` | `fn` | - | Called on connection / query errors |
+| `webhooks` | `string[]` | `[]` | Webhook URLs (same channels as web monitoring) |
+| `webhookRetries` | `number` | `3` | Retry attempts for failed webhook deliveries |
+| `cooldown` | `number` | `0` | Minimum seconds between two consecutive alerts |
+| `dryRun` | `boolean` | `false` | Fetch and diff without saving or alerting |
+| `maxSnapshots` | `number` | - | Keep only the last N snapshots |
+
+```typescript
+import { WatchDiff } from "watchdiff-core";
+
+const wd = new WatchDiff();
+
+// Row-level diff - detect inserts, deletes, and column-level updates
+wd.watchDb("sqlite://./app.db", "products", {
+  primaryKey: ["id"],
+  ignoreColumns: ["updated_at"],
+  interval: 60,
+  onChange: (report) => {
+    for (const c of report.changes) {
+      if (c.kind === "inserted") console.log("New row:", c.row);
+      if (c.kind === "deleted")  console.log("Deleted row:", c.row);
+      if (c.kind === "updated")  console.log("Updated row key:", c.rowKey, c.modifications);
+    }
+  },
+});
+
+// Schema diff - alert when columns are added, removed, or have their type changed
+wd.watchDb("postgresql://user:pass@localhost/mydb", "users", {
+  diffMode: "schema",
+  onSchemaChange: (info) => console.log("Schema changed:", info.changes),
+});
+
+// Aggregate / threshold - alert when a scalar query result changes by ≥ 10%
+wd.watchDb("mysql://user:pass@localhost/shop", "orders", {
+  diffMode: "aggregate",
+  query: "SELECT COUNT(*) FROM orders WHERE status = 'pending'",
+  threshold: 10,
+  onThreshold: (info) => {
+    console.log(`Pending orders changed by ${info.changePercent.toFixed(1)}%`);
+  },
+});
+
+// Value diff - alert whenever a single value changes at all
+wd.watchDb("postgresql://user:pass@localhost/app", "config", {
+  diffMode: "value",
+  query: "SELECT value FROM config WHERE key = 'maintenance_mode'",
+  onChange: (report) => {
+    const change = report.changes[0]!;
+    console.log(`Maintenance mode: ${change.before} → ${change.after}`);
+  },
+});
+
+wd.start();
 ```
 
 
@@ -941,6 +1078,132 @@ interface StatusChangeInfo {
 }
 ```
 
+### Database monitoring
+
+Monitor database tables for row-level changes, schema evolution, aggregate thresholds, or single-value changes.
+Requires the driver package for the database you target (see [Optional dependencies](#optional-dependencies)).
+
+#### Diff modes
+
+| Mode | What is compared | Typical use case |
+|---|---|---|
+| `row` | Each row identified by primary key | Watch a products or users table for CRUD changes |
+| `schema` | Column definitions (name, type, nullability) | Detect DDL changes (ALTER TABLE, etc.) |
+| `aggregate` | A single numeric result of a custom query | Alert when an order count jumps by ≥ 10% |
+| `value` | A single arbitrary value returned by a custom query | Watch a config flag or a max-ID cursor |
+
+#### Row diff
+
+```typescript
+wd.watchDb("sqlite://./app.db", "products", {
+  primaryKey:    ["id"],
+  ignoreColumns: ["updated_at"],  // exclude noisy timestamps
+  interval:      60,
+  onChange: (report) => {
+    for (const c of report.changes) {
+      if (c.kind === "inserted")
+        console.log("New product:", c.row);
+      if (c.kind === "deleted")
+        console.log("Product removed:", c.row);
+      if (c.kind === "updated") {
+        for (const m of c.modifications ?? []) {
+          console.log(`${m.column}: ${m.before} → ${m.after}`);
+        }
+      }
+    }
+  },
+  webhooks: ["https://ntfy.sh/my-products"],
+});
+```
+
+Without `primaryKey`, rows are compared as an unordered set - inserts and deletes are detected but updates are not.
+
+#### Schema diff
+
+```typescript
+wd.watchDb("postgresql://user:pass@localhost/mydb", "users", {
+  diffMode:       "schema",
+  interval:       300,
+  onSchemaChange: (info) => {
+    for (const c of info.changes) {
+      console.log(`Column ${c.column}: ${c.context}`);  // "column added", "type changed", etc.
+    }
+  },
+});
+```
+
+#### Aggregate / threshold diff
+
+```typescript
+wd.watchDb("mysql://user:pass@localhost/shop", "orders", {
+  diffMode:    "aggregate",
+  query:       "SELECT COUNT(*) FROM orders WHERE status = 'pending'",
+  threshold:   10,  // alert when count changes by ≥ 10%
+  onThreshold: (info) => {
+    console.log(`Pending orders: ${info.previousValue} → ${info.currentValue} (${info.changePercent.toFixed(1)}%)`);
+  },
+});
+```
+
+#### Value diff
+
+```typescript
+wd.watchDb("postgresql://user:pass@localhost/app", "config", {
+  diffMode: "value",
+  query:    "SELECT value FROM config WHERE key = 'feature_flag_x'",
+  onChange: (report) => {
+    const ch = report.changes[0]!;
+    console.log(`feature_flag_x changed: ${ch.before} → ${ch.after}`);
+  },
+});
+```
+
+#### CLI
+
+```bash
+# Row diff on a SQLite file
+watchdiff db sqlite://./app.db products --primary-key id --interval 60
+
+# Ignore noisy timestamp column
+watchdiff db sqlite://./app.db products --primary-key id --ignore-columns updated_at
+
+# PostgreSQL schema monitoring
+watchdiff db postgresql://user:pass@localhost/mydb users --diff-mode schema
+
+# Aggregate threshold (alert when count changes by ≥ 10%)
+watchdiff db mysql://user:pass@localhost/shop orders --diff-mode aggregate \
+  --query "SELECT COUNT(*) FROM orders WHERE status='pending'" --threshold 10
+
+# Suppress update alerts, watch only inserts and deletes
+watchdiff db sqlite://./app.db products --no-update
+
+# Send to a webhook on any change
+watchdiff db postgresql://user:pass@localhost/mydb users \
+  --webhook https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+```
+
+#### `DbDiffReport` structure
+
+```typescript
+interface DbDiffReport {
+  connectionString: string;
+  table:            string;
+  label:            string;
+  before:           DbSnapshot;
+  after:            DbSnapshot;
+  changes:          DbChange[];
+  diffMode:         DbDiffMode;
+  comparedAt:       Date;
+}
+
+type DbChangeKind =
+  | "inserted"          // new row (row mode)
+  | "deleted"           // removed row (row mode)
+  | "updated"           // row fields changed (row mode)
+  | "schema_changed"    // column added, removed, or type-changed (schema mode)
+  | "threshold_exceeded"// aggregate value changed beyond threshold (aggregate mode)
+  | "value_changed";    // tracked value changed (value mode)
+```
 
 ### URL comparison
 
@@ -1278,8 +1541,122 @@ interface IStore {
 }
 ```
 
+### Database types (v0.2.0)
+
+### `DbDiffReport`
+
+```typescript
+interface DbDiffReport {
+  connectionString: string;
+  table:            string;
+  label:            string;
+  before:           DbSnapshot;
+  after:            DbSnapshot;
+  changes:          DbChange[];
+  diffMode:         DbDiffMode;   // "row" | "schema" | "aggregate" | "value"
+  comparedAt:       Date;
+}
+```
+
+### `DbChange`
+
+```typescript
+type DbChangeKind =
+  | "inserted"           // row mode - new row detected
+  | "deleted"            // row mode - row removed
+  | "updated"            // row mode - row fields changed
+  | "schema_changed"     // schema mode - column added, removed, or type changed
+  | "threshold_exceeded" // aggregate mode - scalar value changed beyond threshold
+  | "value_changed";     // value mode - tracked single value changed
+
+interface DbChange {
+  kind:           DbChangeKind;
+  rowKey?:        string;           // primary-key value(s) as JSON (row mode)
+  row?:           Row;              // full row content (inserted / deleted)
+  modifications?: RowModification[]; // per-column diffs (updated)
+  column?:        string;           // affected column (schema_changed)
+  before?:        unknown;
+  after?:         unknown;
+  context?:       string;           // human hint, e.g. "column added", "20.00% change"
+}
+
+interface RowModification {
+  column: string;
+  before: unknown;
+  after:  unknown;
+}
+```
+
+### `DbSnapshot`
+
+```typescript
+interface DbSnapshot {
+  connectionString: string;
+  table:            string;
+  rows:             Row[];           // Row = Record<string, unknown>
+  schema?:          ColumnDef[];     // present in schema mode
+  capturedAt:       Date;
+  checksum:         string;          // SHA-256 of serialised rows
+  rowCount:         number;
+}
+
+interface ColumnDef {
+  name:          string;
+  type:          string;
+  nullable:      boolean;
+  primaryKey:    boolean;
+  defaultValue?: string;
+}
+```
+
+### `SchemaChangeInfo`
+
+```typescript
+interface SchemaChangeInfo {
+  connectionString: string;
+  table:            string;
+  label:            string;
+  changes:          DbChange[];
+}
+```
+
+### `ThresholdInfo`
+
+```typescript
+interface ThresholdInfo {
+  connectionString: string;
+  table:            string;
+  label:            string;
+  previousValue:    number;
+  currentValue:     number;
+  changePercent:    number;
+  threshold:        number;
+}
+```
+
+### `DbWatcherStatus`
+
+```typescript
+interface DbWatcherStatus {
+  connectionString: string;
+  table:            string;
+  label:            string;
+  diffMode:         string;
+  interval:         number;
+  paused:           boolean;
+  lastCheckAt:      Date | null;
+  nextCheckAt:      Date | null;
+  lastChangeAt:     Date | null;
+  checksCount:      number;
+  changesCount:     number;
+  errorsCount:      number;
+}
+```
+
 
 ## Helper functions
+
+### Web helpers
 
 ```typescript
 import { reportSummary, reportHasChanges, reportAsDict, changeHuman } from "watchdiff-core";
@@ -1288,6 +1665,38 @@ reportSummary(report);     // "[Book price] 1 modified - 2025-01-01 12:00:00 UTC
 reportHasChanges(report);  // boolean
 reportAsDict(report);      // JSON-serialisable plain object
 changeHuman(change);       // "[~] Changed (price): '19.99' → '24.99'"
+```
+
+### Database helpers (v0.2.0)
+
+```typescript
+import {
+  makeDbWatchConfig,
+  makeDbSnapshot,
+  dbSnapshotKey,
+  dbHasChanges,
+  dbReportSummary,
+} from "watchdiff-core";
+
+// Build a validated config with defaults
+const cfg = makeDbWatchConfig("sqlite://./app.db", "products", {
+  primaryKey: ["id"],
+  interval:   60,
+});
+
+// Create a snapshot manually (useful for tests or custom pipelines)
+const snap = makeDbSnapshot("sqlite://./app.db", "products", rows, schema);
+
+// Stable storage key for a given connection + table (used internally by IStore)
+const key = dbSnapshotKey("sqlite://./app.db", "products");
+// → "db::a3f9c2d41b8e::products"
+
+// Check whether a DbDiffReport contains any changes
+dbHasChanges(report);   // boolean
+
+// Human-readable summary line
+dbReportSummary(report);
+// "[products @ app.db] 2 inserted, 1 deleted - 2025-06-01 14:32:00 UTC"
 ```
 
 
@@ -1455,6 +1864,36 @@ watchdiff export https://example.com --format xlsx --output reports.xlsx
 watchdiff export https://example.com --limit 500 --output reports.csv
 ```
 
+### `db` - database monitoring
+
+```bash
+# Row diff on a SQLite file (detects inserts, deletes, updates)
+watchdiff db sqlite://./app.db products --primary-key id --interval 60
+
+# Ignore a noisy timestamp column
+watchdiff db sqlite://./app.db products --primary-key id --ignore-columns updated_at
+
+# PostgreSQL - schema change detection
+watchdiff db postgresql://user:pass@localhost/mydb users --diff-mode schema
+
+# MySQL - aggregate threshold (alert when pending order count changes by ≥ 10%)
+watchdiff db mysql://user:pass@localhost/shop orders --diff-mode aggregate \
+  --query "SELECT COUNT(*) FROM orders WHERE status='pending'" --threshold 10
+
+# Send to a webhook on change
+watchdiff db sqlite://./app.db products \
+  --webhook https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+
+# Suppress update alerts
+watchdiff db sqlite://./app.db products --no-update
+
+# Dry-run (fetch and diff, no save or alerts)
+watchdiff db sqlite://./app.db products --dry-run
+
+# Output raw JSON on every change
+watchdiff db sqlite://./app.db products --json
+```
+
 ### `init` - generate config file
 
 ```bash
@@ -1501,6 +1940,60 @@ if (previous) {
 }
 store.saveSnapshot(snapshot);
 ```
+
+### Use DB pipeline stages directly
+
+All DB modules are exported and fully typed:
+
+```typescript
+import {
+  DbFetcher, DbDiffEngine,
+  makeDbWatchConfig, makeDbSnapshot,
+  dbHasChanges, dbReportSummary,
+} from "watchdiff-core";
+import { Store } from "watchdiff-core";
+
+const config = makeDbWatchConfig("sqlite://./app.db", "products", {
+  primaryKey:    ["id"],
+  ignoreColumns: ["updated_at"],
+  diffMode:      "row",
+});
+
+const fetcher = new DbFetcher();
+const engine  = new DbDiffEngine();
+const store   = new Store(".watchdiff");
+
+// Fetch current rows
+const result  = await fetcher.fetch(config);
+const current = makeDbSnapshot(config.connectionString, config.table, result.rows, result.schema);
+
+// Load previous snapshot from store
+const storeKey = `db::${config.table}`;
+const stored   = store.loadLatest(storeKey, undefined);
+
+if (stored) {
+  const previous = makeDbSnapshot(
+    config.connectionString,
+    config.table,
+    JSON.parse(stored.content).rows
+  );
+  const report = engine.compare(previous, current, config);
+  if (dbHasChanges(report)) {
+    console.log(dbReportSummary(report));
+    for (const c of report.changes) {
+      console.log(c.kind, c.rowKey, c.modifications ?? c.row);
+    }
+  }
+}
+
+// Persist snapshot
+store.saveSnapshot({
+  url: storeKey, target: undefined,
+  content: JSON.stringify({ rows: current.rows }),
+  rawHtml: "", capturedAt: current.capturedAt, checksum: current.checksum,
+});
+```
+
 
 ### Custom store implementation
 
@@ -1582,6 +2075,9 @@ wd.start();
 |---|---|
 | JS-heavy pages / screenshots | `npm install playwright && npx playwright install chromium` |
 | SQLite storage | `npm install better-sqlite3` |
+| SQLite monitoring (`watchDb`) | `npm install better-sqlite3` |
+| PostgreSQL monitoring (`watchDb`) | `npm install pg` |
+| MySQL / MariaDB monitoring (`watchDb`) | `npm install mysql2` |
 | XLSX export | `npm install exceljs` |
 | Proxy rotation (native fetch) | bundled via `undici` (no extra install) |
 | RSS/Atom diff | bundled via `@xmldom/xmldom` (no extra install) |
@@ -1609,6 +2105,6 @@ If you want a feature that is not yet in the project, open an issue or submit a 
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE).
+This project is licensed under the [BSD 2-Clause License](LICENSE).
 
-You are free to use, study, modify, and distribute this software under the terms of the GPL v3.
+You are free to use, modify, and distribute this software in source and binary forms, with or without modification, provided the copyright notice and disclaimer are retained. No copyleft restrictions - compatible with MIT and proprietary projects.

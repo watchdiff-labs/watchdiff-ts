@@ -107,6 +107,13 @@ function buildPrometheusMetrics(statuses: WatcherStatus[]): string {
     );
 
     metric(
+        "watchdiff_interval_seconds",
+        "Configured check interval in seconds.",
+        "gauge",
+        statuses.map((s) => `watchdiff_interval_seconds{url="${labelEscape(s.url)}",label="${labelEscape(s.label)}"} ${s.interval}`)
+    );
+
+    metric(
         "watchdiff_last_change_timestamp_seconds",
         "Unix timestamp of the last detected change (0 if never).",
         "gauge",

@@ -32,3 +32,25 @@ declare module "exceljs" {
     }
     export = { Workbook };
 }
+
+declare module "pg" {
+    interface QueryResult {
+        rows: Array<Record<string, unknown>>;
+    }
+    class Pool {
+        constructor(opts: { connectionString: string });
+        query(sql: string, params?: unknown[]): Promise<QueryResult>;
+        end(): Promise<void>;
+    }
+    export { Pool, QueryResult };
+}
+
+declare module "mysql2/promise" {
+    type RowDataPacket = Record<string, unknown>;
+    interface Pool {
+        query(sql: string, params?: unknown[]): Promise<[RowDataPacket[], unknown]>;
+        end(): Promise<void>;
+    }
+    function createPool(opts: { uri: string }): Pool;
+    export { createPool, Pool, RowDataPacket };
+}

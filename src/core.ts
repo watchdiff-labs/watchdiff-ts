@@ -25,9 +25,18 @@ import {
     type WatchConfig,
     type WatcherStatus,
 } from "./models.js";
-import { Scheduler } from "./scheduler/index.js";
-import { Store } from "./store/index.js";
-import { Exporter } from "./exporter/index.js";
+import {
+    makeDbWatchConfig,
+    type DbDiffMode,
+    type DbDiffReport,
+    type DbWatchConfig,
+    type SchemaChangeInfo,
+    type ThresholdInfo,
+} from "./db-models.js";
+import { Scheduler }   from "./scheduler/index.js";
+import { DbScheduler, type DbWatcherStatus } from "./db-scheduler/index.js";
+import { Store }        from "./store/index.js";
+import { Exporter }     from "./exporter/index.js";
 import { StatusServer } from "./status-server/index.js";
 
 export interface WatchOptions {
@@ -101,13 +110,45 @@ export interface WatchOptions {
     onStatusChange?: (info: StatusChangeInfo) => void;
 }
 
+export interface DbWatchOptions {
+    /** Custom SELECT query : overrides the default `SELECT * FROM <table>`. */
+    query?:          string;
+    /** Column(s) that uniquely identify a row (default: first column). */
+    primaryKey?:     string[];
+    /** Columns to exclude from comparison. */
+    ignoreColumns?:  string[];
+    /** Diff strategy: "row" (default), "schema", "aggregate", or "value". */
+    diffMode?:       DbDiffMode;
+    /** Seconds between checks (default 300). */
+    interval?:       number;
+    /** Human-readable label. */
+    label?:          string;
+    dryRun?:         boolean;
+    cooldown?:       number;
+    maxSnapshots?:   number;
+    alertOnInsert?:  boolean;
+    alertOnDelete?:  boolean;
+    alertOnUpdate?:  boolean;
+    /** Alert threshold % for aggregate mode (0 = any change). */
+    threshold?:      number;
+    webhooks?:       string[];
+    webhookRetries?: number;
+    onChange?:       (report: DbDiffReport) => void | Promise<void>;
+    onError?:        (err: Error, config: DbWatchConfig) => void;
+    onSchemaChange?: (info: SchemaChangeInfo) => void;
+    onThreshold?:    (info: ThresholdInfo) => void;
+}
+
 export class WatchDiff {
     private readonly store: IStore;
-    private readonly configs: WatchConfig[]                                              = [];
+    private readonly configs: WatchConfig[]                                                = [];
+    private readonly dbConfigs: DbWatchConfig[]                                           = [];
     private readonly globalCallbacks: Array<(report: DiffReport) => void | Promise<void>> = [];
-    private scheduler: Scheduler | null                                                  = null;
-    private stopFn: (() => void) | null                                                  = null;
-    private statusServer: StatusServer | null                                            = null;
+    private scheduler:    Scheduler    | null = null;
+    private dbScheduler:  DbScheduler  | null = null;
+    private stopFn:       (() => void)  | null = null;
+    private dbStopFn:     (() => void)  | null = null;
+    private statusServer: StatusServer  | null = null;
 
     /**
      * @param storageDir - Directory for JSON storage (default ".watchdiff").
@@ -182,6 +223,19 @@ export class WatchDiff {
     }
 
     /**
+     * Register a database table to monitor for changes. Returns `this` for chaining.
+     *
+     * Supported connection strings:
+     *   sqlite://./path/to/db.sqlite
+     *   postgresql://user:pass@host:5432/dbname
+     *   mysql://user:pass@host:3306/dbname
+     */
+    watchDb(connectionString: string, table: string, opts: DbWatchOptions = {}): this {
+        this.dbConfigs.push(makeDbWatchConfig(connectionString, table, opts));
+        return this;
+    }
+
+    /**
      * Register a global callback fired whenever ANY watched URL changes.
      * Returns `this` for chaining.
      */
@@ -201,18 +255,25 @@ export class WatchDiff {
      * `stop()` is called or the process is killed.
      */
     start(): () => void {
-        if (this.configs.length === 0) {
-            console.warn("[watchdiff] No URLs registered. Call .watch() first.");
+        if (this.configs.length === 0 && this.dbConfigs.length === 0) {
+            console.warn("[watchdiff] No URLs or DB tables registered. Call .watch() or .watchDb() first.");
             return () => { };
         }
 
-        this.scheduler = new Scheduler(this.store);
-        for (const cb of this.globalCallbacks) {
-            this.scheduler.addGlobalCallback(cb);
+        if (this.configs.length > 0) {
+            this.scheduler = new Scheduler(this.store);
+            for (const cb of this.globalCallbacks) {
+                this.scheduler.addGlobalCallback(cb);
+            }
+            this.stopFn = this.scheduler.start(this.configs);
         }
 
-        this.stopFn = this.scheduler.start(this.configs);
-        return this.stopFn;
+        if (this.dbConfigs.length > 0) {
+            this.dbScheduler = new DbScheduler(this.store);
+            this.dbStopFn    = this.dbScheduler.start(this.dbConfigs);
+        }
+
+        return () => this.stop();
     }
 
     /**
@@ -221,6 +282,8 @@ export class WatchDiff {
     stop(): void {
         this.stopFn?.();
         this.stopFn = null;
+        this.dbStopFn?.();
+        this.dbStopFn = null;
     }
 
     /**
@@ -278,6 +341,13 @@ export class WatchDiff {
             }));
         }
         return this.scheduler.getStatuses(this.configs);
+    }
+
+    /**
+     * Return runtime status for all registered DB watchers.
+     */
+    getDbStatuses(): DbWatcherStatus[] {
+        return this.dbScheduler?.getStatuses() ?? [];
     }
 
     // ------------------------------------------------------------------

@@ -11,7 +11,7 @@
  */
 
 export { WatchDiff } from "./core.js";
-export type { WatchOptions } from "./core.js";
+export type { WatchOptions, DbWatchOptions } from "./core.js";
 
 export {
     makeWatchConfig,
@@ -47,7 +47,35 @@ export { DiffEngine } from "./diff/index.js";
 export { Store } from "./store/index.js";
 export { SqliteStore } from "./store/sqlite.js";
 export { Notifier } from "./notifier/index.js";
-export { Scheduler } from "./scheduler/index.js";
-export { Exporter } from "./exporter/index.js";
+export { Scheduler }   from "./scheduler/index.js";
+export { DbScheduler } from "./db-scheduler/index.js";
+export type { DbWatcherStatus } from "./db-scheduler/index.js";
+export { DbFetcher }   from "./db-fetcher/index.js";
+export type { DbFetchResult } from "./db-fetcher/index.js";
+export { DbDiffEngine } from "./db-diff/index.js";
+export { Exporter }    from "./exporter/index.js";
 export type { ExportFormat, ExportType } from "./exporter/index.js";
 export { StatusServer } from "./status-server/index.js";
+
+export {
+    makeDbWatchConfig,
+    makeDbSnapshot,
+    dbSnapshotKey,
+    dbHasChanges,
+    dbReportSummary,
+} from "./db-models.js";
+
+export type {
+    DbDiffMode,
+    DbDriver,
+    Row,
+    ColumnDef,
+    DbWatchConfig,
+    DbSnapshot,
+    DbChangeKind,
+    RowModification,
+    DbChange,
+    DbDiffReport,
+    SchemaChangeInfo,
+    ThresholdInfo,
+} from "./db-models.js";
