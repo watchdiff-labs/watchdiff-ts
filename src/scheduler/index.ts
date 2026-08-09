@@ -15,6 +15,8 @@ import { Cleaner } from "../cleaner/index.js";
 import { DiffEngine } from "../diff/index.js";
 import { FetchError, Fetcher } from "../fetcher/index.js";
 import { BrowserFetcher } from "../fetcher/browser.js";
+import { FileFetcher, filePathFromUrl } from "../file-fetcher/index.js";
+import { generateAiSummary, aiSummaryEnabled, getProvider, AiError } from "../ai-summarizer/index.js";
 import {
     reportHasChanges,
     reportSummary,
@@ -52,12 +54,15 @@ const NUMBERS_PATTERN = /\b\d+(\.\d+)?\b/g;
 export class Scheduler {
     private readonly fetcher                                    = new Fetcher();
     private readonly browserFetcher                            = new BrowserFetcher();
+    private readonly fileFetcher                               = new FileFetcher();
     private readonly parser                                     = new Parser();
     private readonly engine                                     = new DiffEngine();
     private readonly notifier                                   = new Notifier();
     private readonly globalCallbacks: GlobalCallback[]          = [];
     private readonly timers: ReturnType<typeof setInterval>[]   = [];
     private readonly urlStates                                  = new Map<string, UrlState>();
+    /** URLs where AI was permanently disabled (invalid key / bad model). */
+    private readonly aiDisabled                                 = new Set<string>();
     private configs: WatchConfig[]                              = [];
 
     constructor(private readonly store: IStore) { }
@@ -241,25 +246,56 @@ export class Scheduler {
         // Schedule next check time
         state.nextCheckAt = new Date(now + this.effectiveInterval(config) * 1000);
 
-        // 1. Fetch (static or browser-rendered)
+        // 1. Fetch (file, browser-rendered, or static HTTP)
         let html: string;
+        let responseTimeMs: number | undefined;
         try {
-            html = config.browser
-                ? await this.browserFetcher.fetch(config)
-                : await this.fetcher.fetch(config);
+            if (config.isFile) {
+                const t0   = Date.now();
+                const res  = await this.fileFetcher.fetch(filePathFromUrl(config.url));
+                responseTimeMs = Date.now() - t0;
+                html = res.content;
+            } else {
+                const t0 = Date.now();
+                html = config.browser
+                    ? await this.browserFetcher.fetch(config)
+                    : await this.fetcher.fetch(config);
+                responseTimeMs = Date.now() - t0;
 
-            // Fetch succeeded - status is 200
-            await this.handleStatusChange(state, 200, config, now);
+                await this.handleStatusChange(state, 200, config, now);
+
+                // expectedStatus check
+                if (config.expectedStatus !== undefined && config.expectedStatus !== 200) {
+                    const err = new Error(
+                        `[${config.label}] Unexpected status: expected ${config.expectedStatus}, got 200`,
+                    );
+                    if (config.onError) config.onError(err, config);
+                    else console.warn(err.message);
+                }
+            }
         } catch (err) {
             state.errorsCount++;
             const fetchErr      = err instanceof FetchError ? err : null;
             const currentStatus = fetchErr?.statusCode ?? 0;
 
-            await this.handleStatusChange(state, currentStatus, config, now);
+            if (!config.isFile) {
+                await this.handleStatusChange(state, currentStatus, config, now);
+
+                if (config.expectedStatus !== undefined && currentStatus === config.expectedStatus) {
+                    // status matches expected even on error path - no extra warning
+                } else if (fetchErr && config.expectedStatus !== undefined && currentStatus !== config.expectedStatus) {
+                    const mismatch = new Error(
+                        `[${config.label}] Unexpected status: expected ${config.expectedStatus}, got ${currentStatus || "unreachable"}`,
+                    );
+                    if (config.onError) config.onError(mismatch, config);
+                }
+            }
 
             const error = err instanceof Error ? err : new Error(String(err));
             if (config.onError) {
-                config.onError(error, config);
+                try { config.onError(error, config); } catch (cbErr) {
+                    console.error(`[${config.label}] onError callback threw:`, cbErr);
+                }
             } else {
                 console.error(`[${config.label}] Fetch failed:`, error.message);
             }
@@ -267,31 +303,39 @@ export class Scheduler {
             return null;
         }
 
-        // 2. Clean (with optional ignoreNumbers)
-        const extraPatterns: RegExp[] = [...config.ignorePatterns];
-        if (config.ignoreNumbers) {
-            extraPatterns.push(NUMBERS_PATTERN);
-        }
-        const cleaner = new Cleaner({
-            extraSelectors: config.ignoreSelectors,
-            extraPatterns,
-        });
-        const $ = cleaner.clean(html);
-
-        // 3. Parse (CSS or XPath)
+        // 2. For file watchers: skip HTML cleaning and parsing, use content directly
         let snapshot;
-        try {
-            snapshot = this.parser.extract($, config);
-        } catch (err) {
-            state.errorsCount++;
-            const error = err instanceof Error ? err : new Error(String(err));
-            if (config.onError) {
-                config.onError(error, config);
-            } else {
-                console.error(`[${config.label}] Parse failed:`, error.message);
+        if (config.isFile) {
+            const { makeSnapshot } = await import("../models.js");
+            snapshot = makeSnapshot(config.url, config.target, html, html);
+        } else {
+            // Clean (with optional ignoreNumbers)
+            const extraPatterns: RegExp[] = [...config.ignorePatterns];
+            if (config.ignoreNumbers) {
+                extraPatterns.push(NUMBERS_PATTERN);
             }
-            state.lastCheckAt = new Date();
-            return null;
+            const cleaner = new Cleaner({
+                extraSelectors: config.ignoreSelectors,
+                extraPatterns,
+            });
+            const $ = cleaner.clean(html);
+
+            // 3. Parse (CSS or XPath)
+            try {
+                snapshot = this.parser.extract($, config);
+            } catch (err) {
+                state.errorsCount++;
+                const error = err instanceof Error ? err : new Error(String(err));
+                if (config.onError) {
+                    try { config.onError(error, config); } catch (cbErr) {
+                        console.error(`[${config.label}] onError callback threw:`, cbErr);
+                    }
+                } else {
+                    console.error(`[${config.label}] Parse failed:`, error.message);
+                }
+                state.lastCheckAt = new Date();
+                return null;
+            }
         }
 
         // 4. Compare
@@ -310,6 +354,9 @@ export class Scheduler {
         }
 
         const report = this.engine.compare(previous, snapshot, config);
+        if (config.trackResponseTime && responseTimeMs !== undefined) {
+            report.responseTimeMs = responseTimeMs;
+        }
 
         if (!config.dryRun) {
             this.store.saveSnapshot(snapshot);
@@ -392,6 +439,38 @@ export class Scheduler {
                     console.debug(`[${config.label}] Screenshot saved: ${screenshotPath}`);
                 } catch (err) {
                     console.warn(`[${config.label}] Screenshot failed:`, err instanceof Error ? err.message : String(err));
+                }
+            }
+
+            // alertIf - custom condition gate
+            if (config.alertIf && !config.alertIf(report)) {
+                console.debug(`[${config.label}] alertIf returned false - alert suppressed.`);
+                return report;
+            }
+
+            // AI summary - smart error handling: skip permanently on auth errors, silently on quota
+            if (aiSummaryEnabled(config) && !this.aiDisabled.has(config.url)) {
+                try {
+                    report.aiSummary = await generateAiSummary(report, getProvider(config) ?? undefined, config.aiPrompt) ?? undefined;
+                    if (report.aiSummary) {
+                        console.debug(`[${config.label}] AI summary: ${report.aiSummary}`);
+                    }
+                } catch (err) {
+                    if (err instanceof AiError) {
+                        if (err.isPermanent) {
+                            this.aiDisabled.add(config.url);
+                            console.warn(
+                                `[${config.label}] AI summaries disabled - ${err.kind}: ${err.message}. ` +
+                                `Check your API key or model name.`,
+                            );
+                        } else if (err.kind === "quota_exceeded") {
+                            console.warn(`[${config.label}] AI quota exceeded - skipping this check, will retry next interval.`);
+                        } else {
+                            console.warn(`[${config.label}] AI summary skipped (${err.kind}): ${err.message}`);
+                        }
+                    } else {
+                        console.warn(`[${config.label}] AI summary error:`, err instanceof Error ? err.message : String(err));
+                    }
                 }
             }
 

@@ -33,11 +33,19 @@ import {
     type SchemaChangeInfo,
     type ThresholdInfo,
 } from "./db-models.js";
-import { Scheduler }   from "./scheduler/index.js";
+import {
+    makeCertWatchConfig,
+    type CertExpiryInfo,
+    type CertChangeInfo,
+    type CertWatchConfig,
+    type CertWatcherStatus,
+} from "./cert-models.js";
+import { Scheduler }      from "./scheduler/index.js";
 import { DbScheduler, type DbWatcherStatus } from "./db-scheduler/index.js";
-import { Store }        from "./store/index.js";
-import { Exporter }     from "./exporter/index.js";
-import { StatusServer } from "./status-server/index.js";
+import { CertScheduler }  from "./cert-scheduler/index.js";
+import { Store }          from "./store/index.js";
+import { Exporter }       from "./exporter/index.js";
+import { StatusServer }   from "./status-server/index.js";
 
 export interface WatchOptions {
     /** CSS selector or XPath expression - undefined = full page. */
@@ -108,6 +116,62 @@ export interface WatchOptions {
     alertOnStatusChange?: boolean;
     /** Called when the HTTP status code changes. */
     onStatusChange?: (info: StatusChangeInfo) => void;
+    /** Only fire alerts when this custom condition returns true. */
+    alertIf?: (report: DiffReport) => boolean;
+    /** Generate an AI-powered natural language summary of detected changes. */
+    aiSummary?: boolean;
+    /**
+     * AI provider for summary generation.
+     * When omitted, auto-detected from ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY env vars.
+     * Use type "custom" with a callAi function for any other provider or local model.
+     */
+    aiProvider?: import("./ai-summarizer/index.js").AiProvider;
+    /** Expected HTTP status code - fire onError when actual status differs. */
+    expectedStatus?: number;
+    /** Record HTTP response time on every check (stored in DiffReport). */
+    trackResponseTime?: boolean;
+}
+
+export interface WatchFileOptions {
+    interval?:        number;
+    label?:           string;
+    diffMode?:        DiffMode;
+    ignorePatterns?:  RegExp[];
+    cooldown?:        number;
+    dryRun?:          boolean;
+    maxSnapshots?:    number;
+    changeThreshold?: number;
+    ignoreNumbers?:   boolean;
+    onChange?:        ((report: DiffReport) => void | Promise<void>) | Array<(report: DiffReport) => void | Promise<void>>;
+    webhooks?:        string[];
+    webhookRetries?:  number;
+    alertIf?:         (report: DiffReport) => boolean;
+    aiSummary?:       boolean;
+    aiProvider?:      import("./ai-summarizer/index.js").AiProvider;
+    onError?:         (err: Error, config: WatchConfig) => void;
+}
+
+export interface WatchApiOptions extends WatchOptions {
+    /** Expected HTTP status code - alert when response differs (default 200). */
+    expectedStatus?:     number;
+    /** Record and expose HTTP response time in DiffReport. */
+    trackResponseTime?:  boolean;
+}
+
+export interface WatchCertOptions {
+    port?:                number;
+    interval?:            number;
+    label?:               string;
+    warnDaysBeforeExpiry?: number;
+    alertOnExpiry?:       boolean;
+    alertOnChange?:       boolean;
+    cooldown?:            number;
+    dryRun?:              boolean;
+    webhooks?:            string[];
+    webhookRetries?:      number;
+    onExpiry?:            (info: CertExpiryInfo)  => void | Promise<void>;
+    onChange?:            (info: CertChangeInfo)  => void | Promise<void>;
+    onError?:             (err: Error, config: CertWatchConfig) => void;
 }
 
 export interface DbWatchOptions {
@@ -137,18 +201,25 @@ export interface DbWatchOptions {
     onError?:        (err: Error, config: DbWatchConfig) => void;
     onSchemaChange?: (info: SchemaChangeInfo) => void;
     onThreshold?:    (info: ThresholdInfo) => void;
+    /** Generate an AI-powered summary of detected DB changes. */
+    aiSummary?:      boolean;
+    /** AI provider - auto-detected from env vars when omitted. */
+    aiProvider?:     import("./ai-summarizer/index.js").AiProvider;
 }
 
 export class WatchDiff {
     private readonly store: IStore;
     private readonly configs: WatchConfig[]                                                = [];
     private readonly dbConfigs: DbWatchConfig[]                                           = [];
+    private readonly certConfigs: CertWatchConfig[]                                       = [];
     private readonly globalCallbacks: Array<(report: DiffReport) => void | Promise<void>> = [];
-    private scheduler:    Scheduler    | null = null;
-    private dbScheduler:  DbScheduler  | null = null;
-    private stopFn:       (() => void)  | null = null;
-    private dbStopFn:     (() => void)  | null = null;
-    private statusServer: StatusServer  | null = null;
+    private scheduler:     Scheduler     | null = null;
+    private dbScheduler:   DbScheduler   | null = null;
+    private certScheduler: CertScheduler | null = null;
+    private stopFn:        (() => void)   | null = null;
+    private dbStopFn:      (() => void)   | null = null;
+    private certStopFn:    (() => void)   | null = null;
+    private statusServer:  StatusServer   | null = null;
 
     /**
      * @param storageDir - Directory for JSON storage (default ".watchdiff").
@@ -215,10 +286,73 @@ export class WatchDiff {
                 onSpike:              opts.onSpike,
                 alertOnStatusChange:  opts.alertOnStatusChange,
                 onStatusChange:       opts.onStatusChange,
+                alertIf:              opts.alertIf,
+                aiSummary:            opts.aiSummary,
+                aiProvider:           opts.aiProvider,
+                expectedStatus:       opts.expectedStatus,
+                trackResponseTime:    opts.trackResponseTime,
                 alert,
             })
         );
 
+        return this;
+    }
+
+    /**
+     * Register a local file or directory to monitor for changes. Returns `this` for chaining.
+     * Uses `file://` prefix internally; no HTTP request is made.
+     */
+    watchFile(path: string, opts: WatchFileOptions = {}): this {
+        const callbacks = opts.onChange
+            ? Array.isArray(opts.onChange) ? opts.onChange : [opts.onChange]
+            : [];
+
+        const alert: AlertConfig | undefined =
+            callbacks.length > 0 || (opts.webhooks?.length ?? 0) > 0
+                ? { onChange: callbacks, webhooks: opts.webhooks ?? [], minChanges: 1, webhookRetries: opts.webhookRetries }
+                : undefined;
+
+        this.configs.push(
+            makeWatchConfig(`file://${path}`, {
+                label:            opts.label ?? path,
+                interval:         opts.interval,
+                diffMode:         opts.diffMode,
+                ignorePatterns:   opts.ignorePatterns,
+                cooldown:         opts.cooldown,
+                dryRun:           opts.dryRun,
+                maxSnapshots:     opts.maxSnapshots,
+                changeThreshold:  opts.changeThreshold,
+                ignoreNumbers:    opts.ignoreNumbers,
+                alertIf:          opts.alertIf,
+                aiSummary:        opts.aiSummary,
+                aiProvider:       opts.aiProvider,
+                onError:          opts.onError,
+                isFile:           true,
+                alert,
+            })
+        );
+
+        return this;
+    }
+
+    /**
+     * Register a REST/JSON API endpoint to monitor. Returns `this` for chaining.
+     * Defaults to JSON diff mode, tracks response time, and validates expected HTTP status.
+     */
+    watchApi(url: string, opts: WatchApiOptions = {}): this {
+        return this.watch(url, {
+            diffMode:          "json",
+            trackResponseTime: opts.trackResponseTime ?? true,
+            ...opts,
+        });
+    }
+
+    /**
+     * Register an SSL/TLS certificate to monitor. Returns `this` for chaining.
+     * Alerts when the certificate is about to expire or when the fingerprint changes.
+     */
+    watchCert(hostname: string, opts: WatchCertOptions = {}): this {
+        this.certConfigs.push(makeCertWatchConfig(hostname, opts));
         return this;
     }
 
@@ -255,8 +389,8 @@ export class WatchDiff {
      * `stop()` is called or the process is killed.
      */
     start(): () => void {
-        if (this.configs.length === 0 && this.dbConfigs.length === 0) {
-            console.warn("[watchdiff] No URLs or DB tables registered. Call .watch() or .watchDb() first.");
+        if (this.configs.length === 0 && this.dbConfigs.length === 0 && this.certConfigs.length === 0) {
+            console.warn("[watchdiff] No watchers registered. Call .watch(), .watchFile(), .watchApi(), .watchDb(), or .watchCert() first.");
             return () => { };
         }
 
@@ -273,6 +407,11 @@ export class WatchDiff {
             this.dbStopFn    = this.dbScheduler.start(this.dbConfigs);
         }
 
+        if (this.certConfigs.length > 0) {
+            this.certScheduler = new CertScheduler();
+            this.certStopFn    = this.certScheduler.start(this.certConfigs);
+        }
+
         return () => this.stop();
     }
 
@@ -284,6 +423,8 @@ export class WatchDiff {
         this.stopFn = null;
         this.dbStopFn?.();
         this.dbStopFn = null;
+        this.certStopFn?.();
+        this.certStopFn = null;
     }
 
     /**
@@ -348,6 +489,13 @@ export class WatchDiff {
      */
     getDbStatuses(): DbWatcherStatus[] {
         return this.dbScheduler?.getStatuses() ?? [];
+    }
+
+    /**
+     * Return runtime status for all registered certificate watchers.
+     */
+    getCertStatuses(): CertWatcherStatus[] {
+        return this.certScheduler?.getStatuses(this.certConfigs) ?? [];
     }
 
     // ------------------------------------------------------------------

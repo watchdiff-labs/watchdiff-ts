@@ -11,6 +11,7 @@ import {
 } from "../db-models.js";
 import { DbFetcher }    from "../db-fetcher/index.js";
 import { DbDiffEngine } from "../db-diff/index.js";
+import { callProvider, resolveProvider, AiError } from "../ai-summarizer/index.js";
 
 const RETRY_BASE_MS = 500;
 
@@ -43,10 +44,11 @@ export interface DbWatcherStatus {
 }
 
 export class DbScheduler {
-    private readonly store:   IStore;
-    private readonly fetcher: DbFetcher    = new DbFetcher();
-    private readonly engine:  DbDiffEngine = new DbDiffEngine();
-    private readonly states:  Map<string, DbState> = new Map();
+    private readonly store:      IStore;
+    private readonly fetcher:    DbFetcher    = new DbFetcher();
+    private readonly engine:     DbDiffEngine = new DbDiffEngine();
+    private readonly states:     Map<string, DbState> = new Map();
+    private readonly aiDisabled: Set<string>  = new Set();
 
     constructor(store: IStore) {
         this.store = store;
@@ -129,12 +131,14 @@ export class DbScheduler {
             state.changesCount += 1;
             state.lastChangeAt  = new Date();
 
-            await this.dispatch(report, state.config);
+            await this.dispatch(report, state.config, key);
         } catch (err) {
             state.errorsCount += 1;
             const error = err instanceof Error ? err : new Error(String(err));
             if (state.config.onError) {
-                state.config.onError(error, state.config);
+                try { state.config.onError(error, state.config); } catch (cbErr) {
+                    console.error(`[watchdiff:db] onError callback threw:`, cbErr);
+                }
             } else {
                 console.error(`[watchdiff:db] ${state.config.label}: ${error.message}`);
             }
@@ -143,41 +147,101 @@ export class DbScheduler {
         }
     }
 
-    private async dispatch(report: DbDiffReport, config: DbWatchConfig): Promise<void> {
+    private async dispatch(report: DbDiffReport, config: DbWatchConfig, key: string): Promise<void> {
+        // AI summary
+        if (config.aiSummary && !this.aiDisabled.has(key)) {
+            const provider = config.aiProvider ?? resolveProvider();
+            if (provider) {
+                try {
+                    const prompt = this.buildDbPrompt(report);
+                    report.aiSummary = await callProvider(prompt, provider) ?? undefined;
+                    if (report.aiSummary) {
+                        console.debug(`[${config.label}] AI summary: ${report.aiSummary}`);
+                    }
+                } catch (err) {
+                    if (err instanceof AiError) {
+                        if (err.isPermanent) {
+                            this.aiDisabled.add(key);
+                            console.warn(`[${config.label}] AI summaries disabled - ${err.kind}: ${err.message}`);
+                        } else if (err.kind === "quota_exceeded") {
+                            console.warn(`[${config.label}] AI quota exceeded - skipping this check.`);
+                        } else {
+                            console.warn(`[${config.label}] AI summary skipped (${err.kind}): ${err.message}`);
+                        }
+                    } else {
+                        console.warn(`[${config.label}] AI summary error:`, err instanceof Error ? err.message : String(err));
+                    }
+                }
+            }
+        }
+
         const schemaChanges = report.changes.filter((c) => c.kind === "schema_changed");
         if (schemaChanges.length > 0 && config.onSchemaChange) {
-            config.onSchemaChange({
-                connectionString: config.connectionString,
-                table:            config.table,
-                label:            config.label,
-                changes:          schemaChanges,
-            });
+            try {
+                config.onSchemaChange({
+                    connectionString: config.connectionString,
+                    table:            config.table,
+                    label:            config.label,
+                    changes:          schemaChanges,
+                });
+            } catch (err) {
+                console.warn(`[watchdiff:db] onSchemaChange callback threw:`, err);
+            }
         }
 
         for (const tc of report.changes.filter((c) => c.kind === "threshold_exceeded")) {
             if (config.onThreshold) {
-                const prev = Number(tc.before);
-                const curr = Number(tc.after);
-                const pct  = prev !== 0 ? Math.abs((curr - prev) / prev) * 100 : 100;
-                config.onThreshold({
-                    connectionString: config.connectionString,
-                    table:            config.table,
-                    label:            config.label,
-                    previousValue:    prev,
-                    currentValue:     curr,
-                    changePercent:    pct,
-                    threshold:        config.threshold ?? 0,
-                });
+                try {
+                    const prev = Number(tc.before);
+                    const curr = Number(tc.after);
+                    const pct  = prev !== 0 ? Math.abs((curr - prev) / prev) * 100 : 100;
+                    config.onThreshold({
+                        connectionString: config.connectionString,
+                        table:            config.table,
+                        label:            config.label,
+                        previousValue:    prev,
+                        currentValue:     curr,
+                        changePercent:    pct,
+                        threshold:        config.threshold ?? 0,
+                    });
+                } catch (err) {
+                    console.warn(`[watchdiff:db] onThreshold callback threw:`, err);
+                }
             }
         }
 
         if (config.onChange) {
-            await config.onChange(report);
+            try { await config.onChange(report); } catch (err) {
+                console.warn(`[watchdiff:db] onChange callback threw:`, err);
+            }
         }
 
         if (config.webhooks?.length) {
             await this.fireWebhooks(report, config);
         }
+    }
+
+    private buildDbPrompt(report: DbDiffReport): string {
+        const lines = report.changes.slice(0, 20).map((c) => {
+            if (c.kind === "inserted")  return `Row inserted: ${c.rowKey ?? JSON.stringify(c.row)}`;
+            if (c.kind === "deleted")   return `Row deleted: ${c.rowKey ?? JSON.stringify(c.row)}`;
+            if (c.kind === "updated") {
+                const mods = (c.modifications ?? [])
+                    .map((m) => `${m.column}: ${String(m.before)} → ${String(m.after)}`)
+                    .join(", ");
+                return `Row ${c.rowKey} updated - ${mods}`;
+            }
+            if (c.kind === "schema_changed") return `Schema ${c.context ?? "changed"}: column "${c.column}"`;
+            if (c.kind === "threshold_exceeded") return `Aggregate changed: ${String(c.before)} → ${String(c.after)}`;
+            if (c.kind === "value_changed")  return `Value changed: ${String(c.before)} → ${String(c.after)}`;
+            return JSON.stringify(c);
+        }).join("\n");
+
+        return (
+            `You are monitoring a database table for changes. Summarize the following diff in 1-2 sentences ` +
+            `in plain language, focusing on what is important to a human reader.\n\n` +
+            `Table: ${report.label} (mode: ${report.diffMode})\nChanges:\n${lines}\n\nSummary:`
+        );
     }
 
     private async fireWebhooks(report: DbDiffReport, config: DbWatchConfig): Promise<void> {

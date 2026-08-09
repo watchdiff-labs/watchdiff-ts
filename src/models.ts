@@ -125,6 +125,27 @@ export interface WatchConfig {
     /** Called when the HTTP status code changes. */
     onStatusChange?: (info: StatusChangeInfo) => void;
     alert?: AlertConfig;
+    /** Custom condition: only alert when this function returns true. */
+    alertIf?: (report: DiffReport) => boolean;
+    /** Generate an AI-powered natural language summary of detected changes. */
+    aiSummary?: boolean;
+    /**
+     * AI provider for summary generation.
+     * When omitted, auto-detected from ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY env vars.
+     */
+    aiProvider?: import("./ai-summarizer/index.js").AiProvider;
+    /**
+     * Custom prompt sent to the AI instead of the default template.
+     * Pass a string for a static prompt, or a function that receives the DiffReport and returns a prompt string.
+     * The prompt is sent as-is to the provider - you control the full instruction.
+     */
+    aiPrompt?: string | ((report: DiffReport) => string | Promise<string>);
+    /** Internal flag set by watchFile() - skip HTTP fetch and use FileFetcher. */
+    isFile?: boolean;
+    /** Expected HTTP status code - fire onError when actual status differs. */
+    expectedStatus?: number;
+    /** Record HTTP response time on every check (stored in DiffReport). */
+    trackResponseTime?: boolean;
 }
 
 export function makeWatchConfig(
@@ -165,6 +186,13 @@ export function makeWatchConfig(
         alertOnStatusChange:    opts.alertOnStatusChange,
         onStatusChange:         opts.onStatusChange,
         alert:                  opts.alert,
+        alertIf:                opts.alertIf,
+        aiSummary:              opts.aiSummary,
+        aiProvider:             opts.aiProvider,
+        aiPrompt:               opts.aiPrompt,
+        isFile:                 opts.isFile,
+        expectedStatus:         opts.expectedStatus,
+        trackResponseTime:      opts.trackResponseTime,
     };
 }
 
@@ -231,6 +259,10 @@ export interface DiffReport {
     after: Snapshot;
     changes: Change[];
     comparedAt: Date;
+    /** AI-generated natural language summary (populated when aiSummary is enabled). */
+    aiSummary?: string;
+    /** HTTP response time in ms (populated when trackResponseTime is enabled). */
+    responseTimeMs?: number;
 }
 
 export function reportHasChanges(report: DiffReport): boolean {

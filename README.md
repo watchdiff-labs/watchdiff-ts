@@ -1,17 +1,21 @@
 # watchdiff-core
 
-**Lightweight web change monitoring - clean diffs, structured alerts, no AI required.**
+**Lightweight web change monitoring - diffs, AI summaries, file/API/SSL/DB monitoring, structured alerts.**
 
-WatchDiff watches web pages and tells you exactly what changed, in plain language.
-No noisy HTML diffs. No external services. No AI black boxes.
+WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then tells you exactly what changed, in plain language or via an AI-generated summary.
 
 - **Deterministic** - same input always produces the same output
 - **Human-readable diffs** - "Price changed: $19 -> $24", not a wall of HTML
+- **AI summaries** - optional Claude / OpenAI / Gemini natural language summary of every diff
 - **CSS selectors AND XPath** - target any zone of any page
 - **JS-heavy pages** - optional Playwright headless browser rendering
 - **Proxy and User-Agent rotation** - avoid rate-limiting
 - **5 diff modes** - line, word, semantic, JSON, RSS/Atom
 - **RSS / Atom monitoring** - item-level diff by guid/id
+- **File monitoring** - watch local files for changes with the same diff pipeline
+- **API monitoring** - watch REST/JSON endpoints with response-time tracking and expected-status alerting
+- **SSL certificate monitoring** - alert when a cert is about to expire or is replaced
+- **Condition-based alerts** - `alertIf` custom function to suppress noise
 - **HTML archiving** - save full page HTML to disk on every change
 - **Screenshot on change** - capture a PNG via Playwright on every detected change
 - **HTTP status monitoring** - alert when a URL returns a different status code (200 → 503, 503 → 200)
@@ -68,6 +72,12 @@ No noisy HTML diffs. No external services. No AI black boxes.
 | Monitor a DB table | `.watchDb("sqlite://./app.db", "products", { diffMode: "row" })` |
 | Monitor DB schema | `.watchDb(connStr, "users", { diffMode: "schema" })` |
 | Monitor a DB aggregate | `.watchDb(connStr, "orders", { diffMode: "aggregate", query: "SELECT COUNT(*) FROM orders", threshold: 10 })` |
+| Monitor a local file | `.watchFile("/etc/nginx/nginx.conf", { interval: 60 })` |
+| Monitor a REST API | `.watchApi("https://api.example.com/prices", { expectedStatus: 200 })` |
+| Track API response time | `trackResponseTime: true` → `report.responseTimeMs` |
+| Alert only on condition | `alertIf: (report) => report.changes.some(c => c.context === "price")` |
+| Monitor SSL certificate | `.watchCert("example.com", { warnDaysBeforeExpiry: 14 })` |
+| AI summary of changes | `aiSummary: true, aiProvider: { type: "gemini", apiKey: "..." }` |
 | Diff two URLs | `wd.compareUrls(urlA, urlB)` or `watchdiff compare <urlA> <urlB>` |
 | Expose status over HTTP | `wd.startStatusServer(9090)` or `--status-port 9090` |
 | CLI one-liner | `watchdiff run https://example.com --target .price --interval 60` |
@@ -1541,7 +1551,7 @@ interface IStore {
 }
 ```
 
-### Database types (v0.2.0)
+### Database types
 
 ### `DbDiffReport`
 
@@ -1667,7 +1677,7 @@ reportAsDict(report);      // JSON-serialisable plain object
 changeHuman(change);       // "[~] Changed (price): '19.99' → '24.99'"
 ```
 
-### Database helpers (v0.2.0)
+### Database helpers
 
 ```typescript
 import {
@@ -1908,6 +1918,237 @@ watchdiff clear https://example.com
 watchdiff clear https://example.com --yes   # skip confirmation
 ```
 
+
+## AI summaries
+
+Add a natural-language summary to every change alert. WatchDiff sends the diff to your AI provider of choice and attaches the result to `DiffReport.aiSummary`.
+
+### Auto-discovery (recommended)
+
+Set an environment variable - no code change needed:
+
+```bash
+# Pick one:
+export ANTHROPIC_API_KEY="sk-ant-..."
+export OPENAI_API_KEY="sk-..."
+export GEMINI_API_KEY="AIza..."
+```
+
+```typescript
+wd.watch("https://shop.example.com/product", {
+  target: ".price",
+  aiSummary: true,   // provider auto-detected from env
+  onChange: (report) => console.log(report.aiSummary),
+  // "The product price increased from $29.99 to $39.99 and is now showing limited stock."
+});
+```
+
+Priority order when multiple keys are set: `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `GEMINI_API_KEY` / `GOOGLE_AI_API_KEY`.
+
+### Explicit provider
+
+```typescript
+aiProvider: { type: "gemini",     apiKey: "...", model: "gemini-3.1-flash-lite" }
+aiProvider: { type: "anthropic",  apiKey: "...", model: "claude-haiku-4-5-20251001" }
+aiProvider: { type: "openai",     apiKey: "...", model: "gpt-4o-mini" }
+```
+
+### OpenAI-compatible providers (Ollama, Mistral, Groq, …)
+
+Any provider that exposes an OpenAI-compatible API works out of the box via `baseUrl`:
+
+```typescript
+// Ollama (local)
+aiProvider: { type: "openai", baseUrl: "http://localhost:11434/v1", model: "llama3" }
+
+// Mistral
+aiProvider: { type: "openai", apiKey: "...", baseUrl: "https://api.mistral.ai/v1", model: "mistral-small" }
+
+// Groq
+aiProvider: { type: "openai", apiKey: "...", baseUrl: "https://api.groq.com/openai/v1", model: "llama3-8b-8192" }
+
+// Together AI
+aiProvider: { type: "openai", apiKey: "...", baseUrl: "https://api.together.xyz/v1", model: "meta-llama/Llama-3-8b-chat-hf" }
+```
+
+Set `OPENAI_BASE_URL` for auto-discovery to pick up a compatible endpoint automatically.
+
+### Custom function (any provider, any library)
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+const client = new Anthropic();
+
+aiProvider: {
+  type: "custom",
+  callAi: async (prompt) => {
+    const msg = await client.messages.create({
+      model: "claude-opus-4-7", max_tokens: 256,
+      messages: [{ role: "user", content: prompt }],
+    });
+    return msg.content[0].type === "text" ? msg.content[0].text : null;
+  },
+}
+```
+
+### Built-in providers
+
+| Provider | `type` | Default model |
+|---|---|---|
+| Google Gemini | `"gemini"` | `gemini-3.1-flash-lite` |
+| Anthropic Claude | `"anthropic"` | `claude-haiku-4-5-20251001` |
+| OpenAI / compatible | `"openai"` | `gpt-4o-mini` |
+| Any custom function | `"custom"` | - |
+
+### Error handling
+
+AI failures are non-fatal - the watcher keeps running and fires its normal alerts.
+
+| Error kind | What triggers it | Behaviour |
+|---|---|---|
+| `invalid_key` | 401 / 403 | AI disabled for this watcher for the rest of the session |
+| `quota_exceeded` | 429 rate limit | Skips AI this check, retries next interval |
+| `model_error` | 400 / unknown model | AI disabled - check your `model` value |
+| `network_error` | DNS / timeout | Skips this check, retries next interval |
+| `empty_response` | Provider returned no text | Warning logged, watcher continues |
+
+```typescript
+import { AiError } from "watchdiff-core";
+
+try {
+  const summary = await generateAiSummary(report, provider);
+} catch (err) {
+  if (err instanceof AiError) {
+    console.log(err.kind);         // "quota_exceeded"
+    console.log(err.isRetryable);  // true  → retry next check
+    console.log(err.isPermanent);  // false → don't disable
+    console.log(err.statusCode);   // 429
+  }
+}
+```
+
+### Custom prompt
+
+Override the default summary template with `aiPrompt` - pass a static string or a function that receives the `DiffReport` and returns a prompt string.
+
+```typescript
+// Static prompt - replaces the full instruction sent to the AI
+wd.watchFile("/tmp/prices.txt", {
+  aiSummary: true,
+  aiPrompt: "Summarize this change in French in one sentence.",
+});
+
+// Dynamic prompt - build the prompt from the diff report
+wd.watch("https://example.com/stock", {
+  aiSummary: true,
+  aiPrompt: (report) =>
+    `You are monitoring ${report.url}. ` +
+    `Explain in plain English what changed: ` +
+    report.changes.map((c) => c.after ?? c.before ?? "").join(", "),
+});
+
+// Async function also supported
+wd.watch("https://api.example.com/prices", {
+  aiSummary: true,
+  aiPrompt: async (report) => {
+    const context = await fetchProductContext(report.url);
+    return `Context: ${context}\n\nSummarize these price changes in 1 sentence: ` +
+      report.changes.map((c) => `${c.before} → ${c.after}`).join(", ");
+  },
+});
+```
+
+The prompt is sent as-is to the provider - no variable substitution happens automatically. Use the function form to interpolate any data from the `DiffReport`.
+
+## File monitoring
+
+Watch local files or config files for changes using the same diff pipeline as URL monitoring.
+
+```typescript
+wd.watchFile("/etc/nginx/nginx.conf", {
+  interval: 30,
+  diffMode: "line",
+  onChange: (report) => console.log("Config changed:", report.changes),
+});
+
+wd.watchFile("/var/log/app.log", {
+  interval: 5,
+  alertIf: (report) => report.changes.some(c => c.after?.includes("ERROR")),
+});
+```
+
+## API monitoring
+
+`watchApi()` is a convenience wrapper over `watch()` that defaults to JSON diff mode, tracks response time, and optionally alerts on unexpected HTTP status codes.
+
+```typescript
+wd.watchApi("https://api.example.com/v1/prices", {
+  interval: 60,
+  expectedStatus: 200,
+  trackResponseTime: true,
+  onChange: (report) => {
+    console.log(`Response time: ${report.responseTimeMs}ms`);
+    console.log("JSON diff:", report.changes);
+  },
+});
+```
+
+`report.responseTimeMs` is populated on every check when `trackResponseTime: true`.
+
+## SSL certificate monitoring
+
+Alert before a certificate expires or when it is silently replaced (renewal, infrastructure change).
+
+```typescript
+wd.watchCert("example.com", {
+  warnDaysBeforeExpiry: 30,     // alert when fewer than 30 days remain
+  alertOnExpiry: true,           // default true
+  alertOnChange: true,           // alert on fingerprint change (cert replaced)
+  webhooks: ["https://discord.com/api/webhooks/..."],
+  onExpiry: (info) => {
+    console.log(`${info.hostname} expires in ${info.daysUntilExpiry} days`);
+  },
+  onChange: (info) => {
+    console.log(`Cert replaced - new expiry ${info.currentValidTo}`);
+  },
+});
+
+// Check status
+console.log(wd.getCertStatuses());
+// [{ hostname: "example.com", daysUntilExpiry: 12, isExpiringSoon: true, ... }]
+```
+
+Default options: `port: 443`, `interval: 3600` (1h), `warnDaysBeforeExpiry: 30`.
+
+## Condition-based alerts - alertIf
+
+Suppress alerts unless a custom condition is met. `alertIf` is evaluated after diffing and before dispatching webhooks/callbacks - avoids noisy alerts without sacrificing monitoring coverage.
+
+```typescript
+// Only alert when the price drops below a threshold
+wd.watch("https://shop.example.com/product", {
+  target: ".price",
+  alertIf: (report) => {
+    const priceChange = report.changes.find(c => c.context === ".price");
+    if (!priceChange?.after) return false;
+    return parseFloat(priceChange.after.replace(/[^0-9.]/g, "")) < 25;
+  },
+});
+
+// Only alert on critical log lines
+wd.watchFile("/var/log/app.log", {
+  alertIf: (report) =>
+    report.changes.some(c => c.after?.match(/CRITICAL|FATAL/)),
+});
+
+// Only alert when a JSON API field exceeds a threshold
+wd.watchApi("https://api.example.com/stats", {
+  alertIf: (report) => {
+    const change = report.changes.find(c => c.context === "errorRate");
+    return Number(change?.after ?? 0) > 5;
+  },
+});
+```
 
 ## Advanced usage
 

@@ -52,6 +52,10 @@ export interface DbWatchConfig {
     onError?:         (err: Error, config: DbWatchConfig) => void;
     onSchemaChange?:  (info: SchemaChangeInfo) => void;
     onThreshold?:     (info: ThresholdInfo) => void;
+    /** Generate an AI-powered summary of detected DB changes. */
+    aiSummary?:       boolean;
+    /** AI provider - auto-detected from env vars when omitted. */
+    aiProvider?:      import("./ai-summarizer/index.js").AiProvider;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +114,8 @@ export interface DbDiffReport {
     changes:          DbChange[];
     diffMode:         DbDiffMode;
     comparedAt:       Date;
+    /** AI-generated summary (populated when aiSummary is enabled on the config). */
+    aiSummary?:       string;
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +179,8 @@ export function makeDbWatchConfig(
         onError:        opts.onError,
         onSchemaChange: opts.onSchemaChange,
         onThreshold:    opts.onThreshold,
+        aiSummary:      opts.aiSummary,
+        aiProvider:     opts.aiProvider,
     };
 }
 

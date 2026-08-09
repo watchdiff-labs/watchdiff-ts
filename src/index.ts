@@ -11,7 +11,7 @@
  */
 
 export { WatchDiff } from "./core.js";
-export type { WatchOptions, DbWatchOptions } from "./core.js";
+export type { WatchOptions, WatchFileOptions, WatchApiOptions, WatchCertOptions, DbWatchOptions } from "./core.js";
 
 export {
     makeWatchConfig,
@@ -56,6 +56,24 @@ export { DbDiffEngine } from "./db-diff/index.js";
 export { Exporter }    from "./exporter/index.js";
 export type { ExportFormat, ExportType } from "./exporter/index.js";
 export { StatusServer } from "./status-server/index.js";
+
+export { CertScheduler } from "./cert-scheduler/index.js";
+export { FileFetcher, filePathFromUrl } from "./file-fetcher/index.js";
+export { generateAiSummary, aiSummaryEnabled, resolveProvider, getProvider, callProvider, AiError } from "./ai-summarizer/index.js";
+export type { AiProvider, AiProviderType, AiErrorKind } from "./ai-summarizer/index.js";
+
+export {
+    makeCertWatchConfig,
+} from "./cert-models.js";
+
+export type {
+    CertWatchConfig,
+    CertSnapshot,
+    CertReport,
+    CertExpiryInfo,
+    CertChangeInfo,
+    CertWatcherStatus,
+} from "./cert-models.js";
 
 export {
     makeDbWatchConfig,
