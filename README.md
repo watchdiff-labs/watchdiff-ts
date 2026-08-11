@@ -16,6 +16,11 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 - **API monitoring** - watch REST/JSON endpoints with response-time tracking and expected-status alerting
 - **SSL certificate monitoring** - alert when a cert is about to expire or is replaced
 - **Condition-based alerts** - `alertIf` custom function to suppress noise
+- **Cron scheduling** - fire checks at exact times with standard 5-field cron expressions
+- **Flapping detection** - re-verify before alerting to suppress transient changes
+- **Sitemap monitoring** - watch a `sitemap.xml` for added or removed URLs
+- **JSON path targeting** - diff only a specific field inside a JSON API response
+- **Email alerts** - send SMTP email notifications on change (requires nodemailer)
 - **HTML archiving** - save full page HTML to disk on every change
 - **Screenshot on change** - capture a PNG via Playwright on every detected change
 - **HTTP status monitoring** - alert when a URL returns a different status code (200 → 503, 503 → 200)
@@ -78,6 +83,12 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 | Alert only on condition | `alertIf: (report) => report.changes.some(c => c.context === "price")` |
 | Monitor SSL certificate | `.watchCert("example.com", { warnDaysBeforeExpiry: 14 })` |
 | AI summary of changes | `aiSummary: true, aiProvider: { type: "gemini", apiKey: "..." }` |
+| Customize the AI prompt | `aiPrompt: "Summarize this diff in French."` or `aiPrompt: (report) => ...` |
+| Fire checks on a schedule | `schedule: "0 9 * * *"` (cron expression) |
+| Confirm change before alerting | `confirmAfter: 30` (flapping detection) |
+| Monitor a sitemap for URL changes | `.watchSitemap("https://example.com/sitemap.xml")` |
+| Watch one JSON field only | `jsonPath: "$.data.price"` |
+| Send email on change | `alert: { email: { to: "...", smtp: { host, port, user, pass } } }` (requires nodemailer) |
 | Diff two URLs | `wd.compareUrls(urlA, urlB)` or `watchdiff compare <urlA> <urlB>` |
 | Expose status over HTTP | `wd.startStatusServer(9090)` or `--status-port 9090` |
 | CLI one-liner | `watchdiff run https://example.com --target .price --interval 60` |
@@ -115,6 +126,16 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
   - [HTTP status monitoring](#http-status-monitoring)
   - [Database monitoring](#database-monitoring)
   - [RSS / Atom monitoring](#rss--atom-monitoring)
+  - [AI summaries](#ai-summaries)
+  - [File monitoring](#file-monitoring)
+  - [API monitoring](#api-monitoring)
+  - [SSL certificate monitoring](#ssl-certificate-monitoring)
+  - [Condition-based alerts](#condition-based-alerts---alertif)
+  - [Cron scheduling](#cron-scheduling)
+  - [Flapping detection](#flapping-detection)
+  - [Sitemap monitoring](#sitemap-monitoring)
+  - [JSON path targeting](#json-path-targeting)
+  - [Email alerts](#email-alerts)
   - [URL comparison](#url-comparison)
   - [Status server](#status-server)
   - [SQLite storage backend](#sqlite-storage-backend)
@@ -285,6 +306,14 @@ Register a URL to monitor.
 | `onSpike` | `fn` | - | Called when a change spike is detected |
 | `alertOnStatusChange` | `boolean` | `false` | Alert when the HTTP status code changes (e.g. `200 → 503` or `503 → 200`) |
 | `onStatusChange` | `fn` | - | Called when the HTTP status code changes |
+| `alert` | `AlertConfig` | - | Full alert config object: `{ onChange, webhooks, minChanges, webhookRetries, email }` |
+| `alertIf` | `fn` | - | Custom condition - alert only when this function returns `true` |
+| `aiSummary` | `boolean` | `false` | Generate an AI natural-language summary of detected changes |
+| `aiProvider` | `AiProvider` | - | AI provider config. Auto-detected from env vars when omitted. |
+| `aiPrompt` | `string \| fn` | - | Override the default AI prompt. String or function receiving `DiffReport`. |
+| `schedule` | `string` | - | 5-field cron expression. Overrides `interval` when set. |
+| `confirmAfter` | `number` | - | Re-verify after N seconds before alerting (flapping detection) |
+| `jsonPath` | `string` | - | JSON path expression to extract a sub-value before diffing (e.g. `"$.data.price"`) |
 
 ```typescript
 wd
@@ -2149,6 +2178,100 @@ wd.watchApi("https://api.example.com/stats", {
   },
 });
 ```
+
+## Cron scheduling
+
+Use a 5-field cron expression instead of a fixed interval. The watcher fires at each matching time instead of every N seconds.
+
+```typescript
+// Every day at 9am
+wd.watch("https://example.com/prices", {
+  schedule: "0 9 * * *",
+  onChange: (report) => console.log("Morning price check:", report.changes),
+});
+
+// Every Monday and Friday at 8:30am
+wd.watch("https://example.com/report", {
+  schedule: "30 8 * * 1,5",
+});
+
+// Every 15 minutes during business hours (Mon-Fri, 9am-6pm)
+wd.watch("https://api.example.com/stock", {
+  schedule: "*/15 9-18 * * 1-5",
+});
+```
+
+Supported syntax: `*`, specific values, lists (`1,3,5`), ranges (`1-5`), and steps (`*/5`, `1-5/2`). When `schedule` is set, `interval` is ignored.
+
+## Flapping detection
+
+Re-verify a change before firing alerts. If the content reverts within `confirmAfter` seconds, the alert is suppressed.
+
+```typescript
+wd.watch("https://example.com/status", {
+  confirmAfter: 30,  // wait 30s then re-check before alerting
+  onChange: (report) => console.log("Confirmed change:", report.changes),
+});
+```
+
+Useful for pages with transient content (A/B tests, live scores, dashboards) where a single-check spike should not trigger an alert.
+
+## Sitemap monitoring
+
+Watch a `sitemap.xml` for added or removed URLs. Handles sitemap index files automatically.
+
+```typescript
+wd.watchSitemap("https://example.com/sitemap.xml", {
+  interval: 3600,
+  onAdded:   (entries) => console.log("New URLs:", entries.map(e => e.url)),
+  onRemoved: (entries) => console.log("Removed URLs:", entries.map(e => e.url)),
+  onChange:  (report)  => console.log(`${report.added.length} added, ${report.removed.length} removed`),
+});
+
+console.log(wd.getSitemapStatuses());
+```
+
+## JSON path targeting
+
+Extract a specific value from a JSON response before diffing. Only the targeted field is compared.
+
+```typescript
+// Only watch the "price" field, ignore all other fields
+wd.watchApi("https://api.example.com/product/42", {
+  jsonPath: "$.data.price",
+  onChange: (report) => console.log("Price changed:", report.changes),
+});
+
+// Nested path with array index
+wd.watchApi("https://api.example.com/leaderboard", {
+  jsonPath: "$.entries[0].score",
+});
+```
+
+## Email alerts
+
+Send email notifications via SMTP when a change is detected. Requires `nodemailer` (`npm install nodemailer`).
+
+```typescript
+wd.watch("https://example.com/prices", {
+  alert: {
+    onChange: [],
+    webhooks: [],
+    minChanges: 1,
+    email: {
+      to: "alerts@example.com",
+      smtp: {
+        host: "smtp.gmail.com",
+        port: 465,
+        user: "you@gmail.com",
+        pass: "app-password",
+      },
+    },
+  },
+});
+```
+
+Optional fields: `from` (defaults to `user@host`), `subject` (defaults to `"[WatchDiff] Change detected: {label}"`). Multiple recipients: `to: ["a@x.com", "b@x.com"]`.
 
 ## Advanced usage
 

@@ -19,6 +19,7 @@ import {
     type AlertConfig,
     type DiffReport,
 } from "../models.js";
+import { sendEmail } from "../mailer/index.js";
 
 const DEFAULT_WEBHOOK_RETRIES = 3;
 const RETRY_BASE_DELAY_MS     = 500;
@@ -42,6 +43,15 @@ export class Notifier {
         await Promise.allSettled(
             alert.webhooks.map((url) => this.sendWebhookWithRetry(url, report, maxAttempts))
         );
+
+        // 3. Email
+        if (alert.email) {
+            try {
+                await sendEmail(alert.email, report);
+            } catch (err) {
+                console.warn("[watchdiff] Email alert failed:", err instanceof Error ? err.message : String(err));
+            }
+        }
     }
 
     private async sendWebhookWithRetry(

@@ -11,7 +11,7 @@
  */
 
 export { WatchDiff } from "./core.js";
-export type { WatchOptions, WatchFileOptions, WatchApiOptions, WatchCertOptions, DbWatchOptions } from "./core.js";
+export type { WatchOptions, WatchFileOptions, WatchApiOptions, WatchCertOptions, DbWatchOptions, WatchSitemapOptions } from "./core.js";
 
 export {
     makeWatchConfig,
@@ -28,6 +28,8 @@ export type {
     DiffMode,
     BrowserOptions,
     AlertConfig,
+    SmtpConfig,
+    EmailConfig,
     IStore,
     WatchConfig,
     Snapshot,
@@ -61,6 +63,24 @@ export { CertScheduler } from "./cert-scheduler/index.js";
 export { FileFetcher, filePathFromUrl } from "./file-fetcher/index.js";
 export { generateAiSummary, aiSummaryEnabled, resolveProvider, getProvider, callProvider, AiError } from "./ai-summarizer/index.js";
 export type { AiProvider, AiProviderType, AiErrorKind } from "./ai-summarizer/index.js";
+
+export { nextCronRun } from "./cron-parser/index.js";
+export { extractJsonPath } from "./json-path/index.js";
+
+export {
+    sitemapHasChanges,
+    makeSitemapSnapshot,
+} from "./sitemap-models.js";
+
+export type {
+    SitemapEntry,
+    SitemapSnapshot,
+    SitemapDiffReport,
+    SitemapWatchConfig,
+} from "./sitemap-models.js";
+
+export { SitemapScheduler } from "./sitemap-scheduler/index.js";
+export type { SitemapWatcherStatus } from "./sitemap-scheduler/index.js";
 
 export {
     makeCertWatchConfig,

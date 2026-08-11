@@ -40,9 +40,15 @@ import {
     type CertWatchConfig,
     type CertWatcherStatus,
 } from "./cert-models.js";
+import {
+    type SitemapDiffReport,
+    type SitemapEntry,
+    type SitemapWatchConfig,
+} from "./sitemap-models.js";
 import { Scheduler }      from "./scheduler/index.js";
 import { DbScheduler, type DbWatcherStatus } from "./db-scheduler/index.js";
 import { CertScheduler }  from "./cert-scheduler/index.js";
+import { SitemapScheduler, type SitemapWatcherStatus } from "./sitemap-scheduler/index.js";
 import { Store }          from "./store/index.js";
 import { Exporter }       from "./exporter/index.js";
 import { StatusServer }   from "./status-server/index.js";
@@ -130,6 +136,14 @@ export interface WatchOptions {
     expectedStatus?: number;
     /** Record HTTP response time on every check (stored in DiffReport). */
     trackResponseTime?: boolean;
+    /** Cron expression (5-field) that overrides interval-based scheduling. */
+    schedule?: string;
+    /** Seconds to wait before confirming a change is real (flapping detection). */
+    confirmAfter?: number;
+    /** JSON path to extract a sub-value before diffing (e.g. "$.data.price"). */
+    jsonPath?: string;
+    /** Custom prompt sent to the AI instead of the default template. */
+    aiPrompt?: string | ((report: DiffReport) => string | Promise<string>);
 }
 
 export interface WatchFileOptions {
@@ -148,7 +162,11 @@ export interface WatchFileOptions {
     alertIf?:         (report: DiffReport) => boolean;
     aiSummary?:       boolean;
     aiProvider?:      import("./ai-summarizer/index.js").AiProvider;
+    aiPrompt?:        string | ((report: DiffReport) => string | Promise<string>);
     onError?:         (err: Error, config: WatchConfig) => void;
+    schedule?:        string;
+    confirmAfter?:    number;
+    jsonPath?:        string;
 }
 
 export interface WatchApiOptions extends WatchOptions {
@@ -172,6 +190,15 @@ export interface WatchCertOptions {
     onExpiry?:            (info: CertExpiryInfo)  => void | Promise<void>;
     onChange?:            (info: CertChangeInfo)  => void | Promise<void>;
     onError?:             (err: Error, config: CertWatchConfig) => void;
+}
+
+export interface WatchSitemapOptions {
+    label?:      string;
+    interval?:   number;
+    onAdded?:    (entries: SitemapEntry[]) => void;
+    onRemoved?:  (entries: SitemapEntry[]) => void;
+    onChange?:   (report: SitemapDiffReport) => void;
+    onError?:    (err: Error) => void;
 }
 
 export interface DbWatchOptions {
@@ -212,14 +239,17 @@ export class WatchDiff {
     private readonly configs: WatchConfig[]                                                = [];
     private readonly dbConfigs: DbWatchConfig[]                                           = [];
     private readonly certConfigs: CertWatchConfig[]                                       = [];
+    private readonly sitemapConfigs: SitemapWatchConfig[]                                 = [];
     private readonly globalCallbacks: Array<(report: DiffReport) => void | Promise<void>> = [];
-    private scheduler:     Scheduler     | null = null;
-    private dbScheduler:   DbScheduler   | null = null;
-    private certScheduler: CertScheduler | null = null;
-    private stopFn:        (() => void)   | null = null;
-    private dbStopFn:      (() => void)   | null = null;
-    private certStopFn:    (() => void)   | null = null;
-    private statusServer:  StatusServer   | null = null;
+    private scheduler:        Scheduler        | null = null;
+    private dbScheduler:      DbScheduler      | null = null;
+    private certScheduler:    CertScheduler    | null = null;
+    private sitemapScheduler: SitemapScheduler | null = null;
+    private stopFn:           (() => void)     | null = null;
+    private dbStopFn:         (() => void)     | null = null;
+    private certStopFn:       (() => void)     | null = null;
+    private sitemapStopFn:    (() => void)     | null = null;
+    private statusServer:     StatusServer     | null = null;
 
     /**
      * @param storageDir - Directory for JSON storage (default ".watchdiff").
@@ -326,8 +356,12 @@ export class WatchDiff {
                 alertIf:          opts.alertIf,
                 aiSummary:        opts.aiSummary,
                 aiProvider:       opts.aiProvider,
+                aiPrompt:         opts.aiPrompt,
                 onError:          opts.onError,
                 isFile:           true,
+                schedule:         opts.schedule,
+                confirmAfter:     opts.confirmAfter,
+                jsonPath:         opts.jsonPath,
                 alert,
             })
         );
@@ -353,6 +387,22 @@ export class WatchDiff {
      */
     watchCert(hostname: string, opts: WatchCertOptions = {}): this {
         this.certConfigs.push(makeCertWatchConfig(hostname, opts));
+        return this;
+    }
+
+    /**
+     * Register a sitemap URL to monitor for added/removed URLs. Returns `this` for chaining.
+     */
+    watchSitemap(url: string, options: WatchSitemapOptions = {}): this {
+        this.sitemapConfigs.push({
+            url,
+            label:      options.label     ?? url,
+            interval:   options.interval  ?? 3600,
+            onAdded:    options.onAdded,
+            onRemoved:  options.onRemoved,
+            onChange:   options.onChange,
+            onError:    options.onError,
+        });
         return this;
     }
 
@@ -389,8 +439,13 @@ export class WatchDiff {
      * `stop()` is called or the process is killed.
      */
     start(): () => void {
-        if (this.configs.length === 0 && this.dbConfigs.length === 0 && this.certConfigs.length === 0) {
-            console.warn("[watchdiff] No watchers registered. Call .watch(), .watchFile(), .watchApi(), .watchDb(), or .watchCert() first.");
+        if (
+            this.configs.length === 0 &&
+            this.dbConfigs.length === 0 &&
+            this.certConfigs.length === 0 &&
+            this.sitemapConfigs.length === 0
+        ) {
+            console.warn("[watchdiff] No watchers registered. Call .watch(), .watchFile(), .watchApi(), .watchDb(), .watchCert(), or .watchSitemap() first.");
             return () => { };
         }
 
@@ -412,6 +467,11 @@ export class WatchDiff {
             this.certStopFn    = this.certScheduler.start(this.certConfigs);
         }
 
+        if (this.sitemapConfigs.length > 0) {
+            this.sitemapScheduler = new SitemapScheduler();
+            this.sitemapStopFn   = this.sitemapScheduler.start(this.sitemapConfigs);
+        }
+
         return () => this.stop();
     }
 
@@ -425,6 +485,8 @@ export class WatchDiff {
         this.dbStopFn = null;
         this.certStopFn?.();
         this.certStopFn = null;
+        this.sitemapStopFn?.();
+        this.sitemapStopFn = null;
     }
 
     /**
@@ -496,6 +558,13 @@ export class WatchDiff {
      */
     getCertStatuses(): CertWatcherStatus[] {
         return this.certScheduler?.getStatuses(this.certConfigs) ?? [];
+    }
+
+    /**
+     * Return runtime status for all registered sitemap watchers.
+     */
+    getSitemapStatuses(): SitemapWatcherStatus[] {
+        return this.sitemapScheduler?.getStatuses(this.sitemapConfigs) ?? [];
     }
 
     // ------------------------------------------------------------------

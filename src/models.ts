@@ -25,6 +25,24 @@ export interface BrowserOptions {
     executablePath?: string;
 }
 
+export interface SmtpConfig {
+    host:    string;
+    port:    number;
+    /** TLS (default true when port=465). */
+    secure?: boolean;
+    user:    string;
+    pass:    string;
+}
+
+export interface EmailConfig {
+    to:       string | string[];
+    /** Defaults to user@host from smtp config. */
+    from?:    string;
+    /** Defaults to "[WatchDiff] Change detected: {label}". */
+    subject?: string;
+    smtp:     SmtpConfig;
+}
+
 export interface AlertConfig {
     /** Callbacks invoked with a DiffReport on each change. */
     onChange: Array<(report: DiffReport) => void | Promise<void>>;
@@ -34,6 +52,8 @@ export interface AlertConfig {
     minChanges: number;
     /** Number of retry attempts for failed webhook deliveries (default 3, 0 = no retry). */
     webhookRetries?: number;
+    /** Email/SMTP alert configuration. */
+    email?: EmailConfig;
 }
 
 export interface SilenceInfo {
@@ -146,6 +166,12 @@ export interface WatchConfig {
     expectedStatus?: number;
     /** Record HTTP response time on every check (stored in DiffReport). */
     trackResponseTime?: boolean;
+    /** Cron expression (5-field) that overrides interval-based scheduling. */
+    schedule?: string;
+    /** Seconds to wait before confirming a change is real (flapping detection). */
+    confirmAfter?: number;
+    /** JSON path expression to extract a sub-value before diffing (e.g. "$.data.price"). */
+    jsonPath?: string;
 }
 
 export function makeWatchConfig(
@@ -193,6 +219,9 @@ export function makeWatchConfig(
         isFile:                 opts.isFile,
         expectedStatus:         opts.expectedStatus,
         trackResponseTime:      opts.trackResponseTime,
+        schedule:               opts.schedule,
+        confirmAfter:           opts.confirmAfter,
+        jsonPath:               opts.jsonPath,
     };
 }
 

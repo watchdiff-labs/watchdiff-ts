@@ -30,6 +30,8 @@ import {
 } from "../models.js";
 import { Notifier } from "../notifier/index.js";
 import { ParserError, Parser } from "../parser/index.js";
+import { nextCronRun } from "../cron-parser/index.js";
+import { extractJsonPath } from "../json-path/index.js";
 
 export type GlobalCallback = (report: DiffReport) => void | Promise<void>;
 
@@ -83,22 +85,49 @@ export class Scheduler {
         this.configs = configs;
         for (const config of configs) {
             this.initState(config);
-            console.info(`[watchdiff] Starting watcher for ${config.label} (interval=${config.interval}s)`);
 
-            void this.check(config);
-            const timer = setInterval(() => {
-                if (!this.getState(config).paused) {
-                    void this.check(config);
+            if (config.schedule) {
+                console.info(`[watchdiff] Starting watcher for ${config.label} (schedule=${config.schedule})`);
+                void this.check(config);
+                this.scheduleCron(config);
+            } else {
+                console.info(`[watchdiff] Starting watcher for ${config.label} (interval=${config.interval}s)`);
+                void this.check(config);
+                const timer = setInterval(() => {
+                    if (!this.getState(config).paused) {
+                        void this.check(config);
+                    }
+                }, this.effectiveInterval(config) * 1000);
+
+                if (typeof timer === "object" && "unref" in timer) {
+                    (timer as NodeJS.Timeout).unref();
                 }
-            }, this.effectiveInterval(config) * 1000);
-
-            if (typeof timer === "object" && "unref" in timer) {
-                (timer as NodeJS.Timeout).unref();
+                this.timers.push(timer);
             }
-            this.timers.push(timer);
         }
 
         return () => this.stop();
+    }
+
+    private scheduleCron(config: WatchConfig): void {
+        const state  = this.getState(config);
+        const next   = nextCronRun(config.schedule!);
+        const delay  = Math.max(0, next.getTime() - Date.now());
+        state.nextCheckAt = next;
+
+        const timer = setTimeout(() => {
+            if (!this.getState(config).paused) {
+                void this.check(config).then(() => {
+                    this.scheduleCron(config);
+                });
+            } else {
+                this.scheduleCron(config);
+            }
+        }, delay);
+
+        if (typeof timer === "object" && "unref" in timer) {
+            (timer as NodeJS.Timeout).unref();
+        }
     }
 
     stop(): void {
@@ -306,9 +335,44 @@ export class Scheduler {
         // 2. For file watchers: skip HTML cleaning and parsing, use content directly
         let snapshot;
         if (config.isFile) {
+            let content = html;
+            if (config.jsonPath) {
+                try {
+                    content = extractJsonPath(html, config.jsonPath);
+                } catch (err) {
+                    const error = err instanceof Error ? err : new Error(String(err));
+                    if (config.onError) {
+                        try { config.onError(error, config); } catch (cbErr) {
+                            console.error(`[${config.label}] onError callback threw:`, cbErr);
+                        }
+                    } else {
+                        console.warn(`[${config.label}] jsonPath extraction failed: ${error.message}`);
+                    }
+                    state.lastCheckAt = new Date();
+                    return null;
+                }
+            }
             const { makeSnapshot } = await import("../models.js");
-            snapshot = makeSnapshot(config.url, config.target, html, html);
+            snapshot = makeSnapshot(config.url, config.target, content, content);
         } else {
+            // Apply jsonPath extraction before HTML cleaning when content looks like JSON
+            if (config.jsonPath && html.trimStart().startsWith("{") || config.jsonPath && html.trimStart().startsWith("[")) {
+                try {
+                    html = extractJsonPath(html, config.jsonPath);
+                } catch (err) {
+                    const error = err instanceof Error ? err : new Error(String(err));
+                    if (config.onError) {
+                        try { config.onError(error, config); } catch (cbErr) {
+                            console.error(`[${config.label}] onError callback threw:`, cbErr);
+                        }
+                    } else {
+                        console.warn(`[${config.label}] jsonPath extraction failed: ${error.message}`);
+                    }
+                    state.lastCheckAt = new Date();
+                    return null;
+                }
+            }
+
             // Clean (with optional ignoreNumbers)
             const extraPatterns: RegExp[] = [...config.ignorePatterns];
             if (config.ignoreNumbers) {
@@ -366,6 +430,24 @@ export class Scheduler {
         }
 
         if (reportHasChanges(report)) {
+            // Flapping detection: wait confirmAfter seconds and re-check before alerting
+            if (config.confirmAfter && config.confirmAfter > 0) {
+                console.debug(`[${config.label}] Change detected - confirming in ${config.confirmAfter}s.`);
+                setTimeout(async () => {
+                    try {
+                        const confirmed = await this.checkConfirm(config, snapshot.content);
+                        if (confirmed) {
+                            await this.dispatchChange(report, config, state, snapshot, html);
+                        } else {
+                            console.debug(`[${config.label}] Change reverted before confirmation - suppressed.`);
+                        }
+                    } catch (err) {
+                        console.warn(`[${config.label}] Confirm check failed:`, err instanceof Error ? err.message : String(err));
+                    }
+                }, config.confirmAfter * 1000).unref?.();
+                return report;
+            }
+
             state.changesCount++;
             state.lastChangeAt = new Date();
 
@@ -526,5 +608,166 @@ export class Scheduler {
         }
 
         return report;
+    }
+
+    /**
+     * Re-fetch and compare content against `expectedContent` to confirm a change is stable.
+     * Returns true if the change persists, false if the content reverted.
+     */
+    private async checkConfirm(config: WatchConfig, expectedContent: string): Promise<boolean> {
+        try {
+            let html: string;
+            if (config.isFile) {
+                const res = await this.fileFetcher.fetch(filePathFromUrl(config.url));
+                html = res.content;
+            } else {
+                html = config.browser
+                    ? await this.browserFetcher.fetch(config)
+                    : await this.fetcher.fetch(config);
+            }
+
+            if (config.jsonPath) {
+                const trimmed = html.trimStart();
+                if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                    try { html = extractJsonPath(html, config.jsonPath); } catch { /* ignore */ }
+                }
+            }
+
+            let content: string;
+            if (config.isFile) {
+                content = html;
+            } else {
+                const extraPatterns: RegExp[] = [...config.ignorePatterns];
+                if (config.ignoreNumbers) extraPatterns.push(NUMBERS_PATTERN);
+                const cleaner = new Cleaner({ extraSelectors: config.ignoreSelectors, extraPatterns });
+                const $ = cleaner.clean(html);
+                const snap = this.parser.extract($, config);
+                content = snap.content;
+            }
+
+            return content === expectedContent;
+        } catch {
+            return false;
+        }
+    }
+
+    /** Fire all alerts and side-effects for a confirmed change. */
+    private async dispatchChange(
+        report:   DiffReport,
+        config:   WatchConfig,
+        state:    UrlState,
+        snapshot: { rawHtml: string },
+        html:     string,
+    ): Promise<void> {
+        const now = Date.now();
+
+        state.changesCount++;
+        state.lastChangeAt = new Date();
+
+        if (!config.dryRun) {
+            this.store.saveReport(report);
+        }
+
+        console.info(`[${config.label}] ${reportSummary(report)}`);
+
+        if (config.changeThreshold && config.changeThreshold > 0) {
+            const previous = this.store.loadLatest(config.url, config.target);
+            if (previous) {
+                const totalLen   = Math.max(previous.content.length, 1);
+                const changedLen = report.changes.reduce(
+                    (s, c) => s + Math.max(c.before?.length ?? 0, c.after?.length ?? 0),
+                    0,
+                );
+                if (changedLen / totalLen < config.changeThreshold) {
+                    console.debug(`[${config.label}] Change below threshold - suppressed.`);
+                    return;
+                }
+            }
+        }
+
+        if (config.changeSpikeWindow && config.changeSpikeThreshold) {
+            const windowMs = config.changeSpikeWindow * 1000;
+            state.recentChangeTimes = state.recentChangeTimes.filter((t) => now - t < windowMs);
+            state.recentChangeTimes.push(now);
+            if (
+                state.recentChangeTimes.length >= config.changeSpikeThreshold &&
+                now - state.lastSpikeAt > windowMs
+            ) {
+                state.lastSpikeAt = now;
+                const info: SpikeInfo = {
+                    url:             config.url,
+                    label:           config.label,
+                    changesInWindow: state.recentChangeTimes.length,
+                    windowSeconds:   config.changeSpikeWindow,
+                };
+                console.warn(`[${config.label}] Change spike: ${info.changesInWindow} changes in ${info.windowSeconds}s`);
+                if (config.onSpike) {
+                    try { config.onSpike(info); } catch (err) {
+                        console.warn("[watchdiff] onSpike callback error:", err);
+                    }
+                }
+            }
+        }
+
+        if (config.archiveHtml && !config.dryRun) {
+            const storeDir    = this.store.getDirectory?.() ?? ".watchdiff";
+            const archiveDir  = join(storeDir, "archive");
+            mkdirSync(archiveDir, { recursive: true });
+            const urlHash     = createHash("md5").update(config.url).digest("hex").slice(0, 8);
+            const ts          = new Date().toISOString().replace(/[:.]/g, "-");
+            writeFileSync(join(archiveDir, `${urlHash}_${ts}.html`), snapshot.rawHtml || html, "utf-8");
+        }
+
+        if (config.screenshotOnChange && config.browser && !config.dryRun) {
+            try {
+                const storeDir   = this.store.getDirectory?.() ?? ".watchdiff";
+                const archiveDir = join(storeDir, "archive");
+                mkdirSync(archiveDir, { recursive: true });
+                const urlHash    = createHash("md5").update(config.url).digest("hex").slice(0, 8);
+                const ts         = new Date().toISOString().replace(/[:.]/g, "-");
+                const buf        = await this.browserFetcher.screenshot(config);
+                writeFileSync(join(archiveDir, `${urlHash}_${ts}.png`), buf);
+            } catch (err) {
+                console.warn(`[${config.label}] Screenshot failed:`, err instanceof Error ? err.message : String(err));
+            }
+        }
+
+        if (config.alertIf && !config.alertIf(report)) {
+            console.debug(`[${config.label}] alertIf returned false - alert suppressed.`);
+            return;
+        }
+
+        if (aiSummaryEnabled(config) && !this.aiDisabled.has(config.url)) {
+            try {
+                report.aiSummary = await generateAiSummary(report, getProvider(config) ?? undefined, config.aiPrompt) ?? undefined;
+            } catch (err) {
+                if (err instanceof AiError && err.isPermanent) {
+                    this.aiDisabled.add(config.url);
+                }
+            }
+        }
+
+        const cooldownMs    = (config.cooldown ?? 0) * 1000;
+        const cooldownReady = now - state.lastAlertAt >= cooldownMs;
+
+        if (!cooldownReady) {
+            const remaining = Math.ceil((cooldownMs - (now - state.lastAlertAt)) / 1000);
+            console.debug(`[${config.label}] Alert suppressed - cooldown active (${remaining}s remaining).`);
+            return;
+        }
+
+        if (!config.dryRun) {
+            state.lastAlertAt = now;
+
+            for (const cb of this.globalCallbacks) {
+                try { await cb(report); } catch (err) {
+                    console.warn("[watchdiff] Global callback error:", err);
+                }
+            }
+
+            if (config.alert) {
+                await this.notifier.notify(report, config.alert);
+            }
+        }
     }
 }

@@ -15,7 +15,10 @@
   "bin": {
     "watchdiff": "./dist/cli/main.js"
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsup && tsc --declaration --declarationMap --emitDeclarationOnly",
     "postbuild": "node -e \"const fs=require('fs');const f='dist/cli/main.js';let c=fs.readFileSync(f,'utf8');c=c.replace(/^(#!\\/usr\\/bin\\/env node\\n)+/,'#!/usr/bin/env node\\n');fs.writeFileSync(f,c)\" && chmod +x dist/cli/main.js",
@@ -23,7 +26,13 @@
     "typecheck": "tsc --noEmit",
     "dev": "vitest"
   },
-  "keywords": ["watchdiff", "web", "monitoring", "diff", "change-detection"],
+  "keywords": [
+    "watchdiff",
+    "web",
+    "monitoring",
+    "diff",
+    "change-detection"
+  ],
   "author": "",
   "license": "BSD-2-Clause",
   "dependencies": {
@@ -40,19 +49,34 @@
     "better-sqlite3": ">=9.0.0",
     "exceljs": ">=4.0.0",
     "mysql2": ">=3.0.0",
+    "nodemailer": ">=6.0.0",
     "pg": ">=8.0.0",
     "playwright": ">=1.40.0"
   },
   "peerDependenciesMeta": {
-    "better-sqlite3": { "optional": true },
-    "exceljs": { "optional": true },
-    "mysql2": { "optional": true },
-    "pg": { "optional": true },
-    "playwright": { "optional": true }
+    "better-sqlite3": {
+      "optional": true
+    },
+    "exceljs": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
+    },
+    "nodemailer": {
+      "optional": true
+    },
+    "pg": {
+      "optional": true
+    },
+    "playwright": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.19.17",
+    "@types/nodemailer": "^6.4.24",
     "tsup": "^8.5.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5"
