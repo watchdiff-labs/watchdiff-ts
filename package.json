@@ -1,6 +1,6 @@
 {
   "name": "watchdiff-core",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Lightweight web change monitoring - diffs, AI summaries, file/API/SSL/DB monitoring, structured alerts.",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
