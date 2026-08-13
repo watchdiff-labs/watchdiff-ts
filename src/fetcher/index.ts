@@ -59,7 +59,11 @@ export class Fetcher {
 
     private async attemptFetch(config: WatchConfig): Promise<string> {
         const userAgent  = pickRandom(config.userAgents ?? []) ?? pickRandom([...DEFAULT_USER_AGENTS]) ?? FALLBACK_UA;
-        const headers    = { ...BASE_HEADERS, "User-Agent": userAgent, ...config.headers };
+        const headers: Record<string, string> = { ...BASE_HEADERS, "User-Agent": userAgent, ...config.headers };
+        if (config.cookies && Object.keys(config.cookies).length > 0) {
+            const existing = headers["Cookie"] ? headers["Cookie"] + "; " : "";
+            headers["Cookie"] = existing + Object.entries(config.cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+        }
         const controller = new AbortController();
         const timer      = setTimeout(() => controller.abort(), config.timeout);
 

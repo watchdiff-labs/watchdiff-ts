@@ -62,6 +62,8 @@ export interface WatchOptions {
     label?: string;
     /** Extra HTTP headers. */
     headers?: Record<string, string>;
+    /** Cookies to send with every request (merged into the Cookie header). */
+    cookies?: Record<string, string>;
     /** HTTP timeout in milliseconds (default 15000). */
     timeout?: number;
     /** CSS selectors to strip before diffing. */
@@ -290,6 +292,7 @@ export class WatchDiff {
                 interval:             opts.interval,
                 label:                opts.label,
                 headers:              opts.headers,
+                cookies:              opts.cookies,
                 timeout:              opts.timeout,
                 ignoreSelectors:      opts.ignoreSelectors,
                 ignorePatterns:       opts.ignorePatterns,
@@ -319,8 +322,12 @@ export class WatchDiff {
                 alertIf:              opts.alertIf,
                 aiSummary:            opts.aiSummary,
                 aiProvider:           opts.aiProvider,
+                aiPrompt:             opts.aiPrompt,
                 expectedStatus:       opts.expectedStatus,
                 trackResponseTime:    opts.trackResponseTime,
+                schedule:             opts.schedule,
+                confirmAfter:         opts.confirmAfter,
+                jsonPath:             opts.jsonPath,
                 alert,
             })
         );

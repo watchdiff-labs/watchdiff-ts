@@ -20,6 +20,9 @@ node_modules/
 .DS_Store
 Thumbs.db
 
+# Claude Code internal
+.claude/
+
 # Editors
 .vscode/
 .idea/
@@ -29,5 +32,3 @@ Thumbs.db
 # Logs
 *.log
 npm-debug.log*
-
-CLAUDE.md

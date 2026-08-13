@@ -1,5 +1,9 @@
 # watchdiff-core
 
+[![npm version](https://img.shields.io/npm/v/watchdiff-core?color=blue)](https://www.npmjs.com/package/watchdiff-core)
+[![CI](https://github.com/r-seize/watchdiff-ts/actions/workflows/ci.yml/badge.svg)](https://github.com/r-seize/watchdiff-ts/actions/workflows/ci.yml)
+[![License: BSD-2-Clause](https://img.shields.io/badge/license-BSD--2--Clause-blue)](LICENSE)
+
 **Lightweight web change monitoring - diffs, AI summaries, file/API/SSL/DB monitoring, structured alerts.**
 
 WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then tells you exactly what changed, in plain language or via an AI-generated summary.
@@ -20,6 +24,7 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 - **Flapping detection** - re-verify before alerting to suppress transient changes
 - **Sitemap monitoring** - watch a `sitemap.xml` for added or removed URLs
 - **JSON path targeting** - diff only a specific field inside a JSON API response
+- **Cookie-based authentication** - pass session cookies to monitor login-protected pages
 - **Email alerts** - send SMTP email notifications on change (requires nodemailer)
 - **HTML archiving** - save full page HTML to disk on every change
 - **Screenshot on change** - capture a PNG via Playwright on every detected change
@@ -88,6 +93,7 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 | Confirm change before alerting | `confirmAfter: 30` (flapping detection) |
 | Monitor a sitemap for URL changes | `.watchSitemap("https://example.com/sitemap.xml")` |
 | Watch one JSON field only | `jsonPath: "$.data.price"` |
+| Monitor authenticated pages | `cookies: { session: "abc123", csrftoken: "xyz" }` |
 | Send email on change | `alert: { email: { to: "...", smtp: { host, port, user, pass } } }` (requires nodemailer) |
 | Diff two URLs | `wd.compareUrls(urlA, urlB)` or `watchdiff compare <urlA> <urlB>` |
 | Expose status over HTTP | `wd.startStatusServer(9090)` or `--status-port 9090` |
@@ -135,6 +141,7 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
   - [Flapping detection](#flapping-detection)
   - [Sitemap monitoring](#sitemap-monitoring)
   - [JSON path targeting](#json-path-targeting)
+  - [Cookie-based authentication](#cookie-based-authentication)
   - [Email alerts](#email-alerts)
   - [URL comparison](#url-comparison)
   - [Status server](#status-server)
@@ -304,6 +311,8 @@ Register a URL to monitor.
 | `changeSpikeWindow` | `number` | - | Spike detection time window in seconds |
 | `changeSpikeThreshold` | `number` | - | Alert when this many changes occur inside `changeSpikeWindow` |
 | `onSpike` | `fn` | - | Called when a change spike is detected |
+| `expectedStatus` | `number` | - | Fire `onError` when the HTTP status code differs from this expected value |
+| `trackResponseTime` | `boolean` | `false` | Record HTTP response time on every check — available as `report.responseTimeMs` |
 | `alertOnStatusChange` | `boolean` | `false` | Alert when the HTTP status code changes (e.g. `200 → 503` or `503 → 200`) |
 | `onStatusChange` | `fn` | - | Called when the HTTP status code changes |
 | `alert` | `AlertConfig` | - | Full alert config object: `{ onChange, webhooks, minChanges, webhookRetries, email }` |
@@ -314,6 +323,7 @@ Register a URL to monitor.
 | `schedule` | `string` | - | 5-field cron expression. Overrides `interval` when set. |
 | `confirmAfter` | `number` | - | Re-verify after N seconds before alerting (flapping detection) |
 | `jsonPath` | `string` | - | JSON path expression to extract a sub-value before diffing (e.g. `"$.data.price"`) |
+| `cookies` | `Record<string, string>` | - | Cookies sent with every request — merged into the `Cookie` header (e.g. `{ session: "abc" }`) |
 
 ```typescript
 wd
@@ -2248,6 +2258,34 @@ wd.watchApi("https://api.example.com/leaderboard", {
 });
 ```
 
+## Cookie-based authentication
+
+Pass cookies with every request to monitor pages that require a login session. Cookies are merged into the outgoing `Cookie` header on top of any `headers` you supply.
+
+```typescript
+wd.watch("https://app.example.com/dashboard", {
+  cookies: {
+    session:   "your-session-token",
+    csrftoken: "your-csrf-token",
+  },
+  interval: 300,
+  onChange: (report) => console.log(report.changes),
+});
+```
+
+You can combine `cookies` with `headers` — the cookie string is appended to any existing `Cookie` header:
+
+```typescript
+wd.watch("https://api.example.com/account", {
+  headers: { Authorization: "Bearer token123" },
+  cookies: { _ga: "GA1.1.0000000000.0000000000" },
+  jsonPath: "$.balance",
+  interval: 60,
+});
+```
+
+> Tip: copy cookie values from your browser's DevTools → Network tab → Request Headers.
+
 ## Email alerts
 
 Send email notifications via SMTP when a change is detected. Requires `nodemailer` (`npm install nodemailer`).
@@ -2443,6 +2481,7 @@ wd.start();
 | PostgreSQL monitoring (`watchDb`) | `npm install pg` |
 | MySQL / MariaDB monitoring (`watchDb`) | `npm install mysql2` |
 | XLSX export | `npm install exceljs` |
+| Email alerts (SMTP) | `npm install nodemailer` |
 | Proxy rotation (native fetch) | bundled via `undici` (no extra install) |
 | RSS/Atom diff | bundled via `@xmldom/xmldom` (no extra install) |
 | Status server / Prometheus metrics | built-in Node.js `http` (no extra install) |

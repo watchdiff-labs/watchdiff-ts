@@ -89,6 +89,8 @@ export interface WatchConfig {
     label: string;
     /** Extra HTTP headers for this URL. */
     headers: Record<string, string>;
+    /** Cookies to send with every request (merged into the Cookie header). */
+    cookies?: Record<string, string>;
     /** HTTP timeout in milliseconds (default 15000). */
     timeout: number;
     /** CSS selectors to strip before diffing. */
@@ -184,6 +186,7 @@ export function makeWatchConfig(
         interval:               opts.interval ?? 300,
         label:                  opts.label ?? url,
         headers:                opts.headers ?? {},
+        cookies:                opts.cookies,
         timeout:                opts.timeout ?? 15_000,
         ignoreSelectors:        opts.ignoreSelectors ?? [],
         ignorePatterns:         opts.ignorePatterns ?? [],
