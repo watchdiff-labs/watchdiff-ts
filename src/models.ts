@@ -79,8 +79,49 @@ export interface SpikeInfo {
     windowSeconds: number;
 }
 
+// ---------------------------------------------------------------------------
+// Maintenance windows
+// ---------------------------------------------------------------------------
+
+export interface MaintenanceWindow {
+    /** ISO string or Date marking start of maintenance window. */
+    from: string | Date;
+    /** ISO string or Date marking end of maintenance window. */
+    to:   string | Date;
+}
+
+// ---------------------------------------------------------------------------
+// Active hours
+// ---------------------------------------------------------------------------
+
+export interface ActiveBetween {
+    /** IANA timezone (e.g. "Europe/Paris"). Defaults to UTC. */
+    timezone?: string;
+    /** Days of week active. Defaults to all days. */
+    days?: Array<"monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday">;
+    /** HH:MM start of active window (e.g. "09:00") */
+    from: string;
+    /** HH:MM end of active window (e.g. "18:00") */
+    to: string;
+}
+
+// ---------------------------------------------------------------------------
+// Failure policy
+// ---------------------------------------------------------------------------
+
+export interface FailurePolicy {
+    /** Number of consecutive fetch errors before firing onError/alerts (default 1 = immediate). */
+    consecutiveFailures?: number;
+    /** Number of consecutive successes required after failures before re-enabling alerts (default 1). */
+    recoveryChecks?: number;
+    /** Honour the Retry-After header on 429/503 responses (default false). */
+    respectRetryAfter?: boolean;
+}
+
 export interface WatchConfig {
     url: string;
+    /** Stable watcher identity key. When set, storage keys and pause/resume use this instead of URL. */
+    id?: string;
     /** CSS selector or XPath expression to narrow monitoring. undefined = full page. */
     target?: string;
     /** Seconds between checks (default 300). */
@@ -174,6 +215,12 @@ export interface WatchConfig {
     confirmAfter?: number;
     /** JSON path expression to extract a sub-value before diffing (e.g. "$.data.price"). */
     jsonPath?: string;
+    /** Time windows during which checks are skipped entirely. */
+    maintenanceWindows?: MaintenanceWindow[];
+    /** Restrict monitoring to specific hours/days of the week. */
+    activeBetween?: ActiveBetween;
+    /** Policy controlling how many consecutive failures are needed before alerting. */
+    failurePolicy?: FailurePolicy;
 }
 
 export function makeWatchConfig(
@@ -182,6 +229,7 @@ export function makeWatchConfig(
 ): WatchConfig {
     return {
         url,
+        id:                     opts.id,
         target:                 opts.target,
         interval:               opts.interval ?? 300,
         label:                  opts.label ?? url,
@@ -225,6 +273,9 @@ export function makeWatchConfig(
         schedule:               opts.schedule,
         confirmAfter:           opts.confirmAfter,
         jsonPath:               opts.jsonPath,
+        maintenanceWindows:     opts.maintenanceWindows,
+        activeBetween:          opts.activeBetween,
+        failurePolicy:          opts.failurePolicy,
     };
 }
 
@@ -337,10 +388,14 @@ export function reportAsDict(report: DiffReport): Record<string, unknown> {
 
 export interface WatcherStatus {
     url: string;
+    /** Stable watcher ID (set via WatchOptions.id). Undefined when not configured. */
+    id?: string;
     label: string;
     target: string | undefined;
     interval: number;
     paused: boolean;
+    /** Whether the watcher is currently inside a maintenance window. */
+    inMaintenance: boolean;
     /** Timestamp of the last completed check (null = never checked). */
     lastCheckAt: Date | null;
     /** Estimated timestamp of the next scheduled check. */

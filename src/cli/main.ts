@@ -529,6 +529,168 @@ program
     });
 
 // ---------------------------------------------------------------------------
+// validate
+// ---------------------------------------------------------------------------
+
+program
+    .command("validate")
+    .description("Validate a watchdiff.config.json file and report issues")
+    .option("-c, --config <file>", "JSON config file to validate", "watchdiff.config.json")
+    .action(async (opts: { config: string }) => {
+        const filePath = opts.config;
+        let allPassed  = true;
+
+        const pass = (msg: string) => console.log(chalk.green(`  ✅ ${msg}`));
+        const fail = (msg: string) => { console.log(chalk.red(`  ❌ ${msg}`)); allPassed = false; };
+
+        console.log(chalk.bold(`\nValidating ${filePath}\n`));
+
+        // 1. File existence
+        if (!existsSync(filePath)) {
+            fail(`File not found: ${filePath}`);
+            process.exit(1);
+        }
+        pass("File exists");
+
+        // 2. JSON parse
+        let raw: unknown;
+        try {
+            raw = JSON.parse(readFileSync(filePath, "utf-8"));
+            pass("Valid JSON");
+        } catch (err) {
+            fail(`Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+        }
+
+        if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+            fail("Root must be an object");
+            process.exit(1);
+        }
+
+        const cfg = raw as Record<string, unknown>;
+
+        // 3. watches array
+        if (!Array.isArray(cfg["watches"])) {
+            fail("'watches' must be an array");
+            process.exit(1);
+        }
+
+        const watches = cfg["watches"] as unknown[];
+        if (watches.length === 0) {
+            fail("'watches' array must not be empty");
+            allPassed = false;
+        } else {
+            pass(`'watches' contains ${watches.length} entry(ies)`);
+        }
+
+        const validDiffModes = new Set(["line", "semantic", "word", "json", "rss"]);
+
+        for (let i = 0; i < watches.length; i++) {
+            const w = watches[i];
+            const pfx = `watches[${i}]`;
+
+            if (typeof w !== "object" || w === null || Array.isArray(w)) {
+                fail(`${pfx}: must be an object`);
+                continue;
+            }
+
+            const e = w as Record<string, unknown>;
+
+            // URL validation
+            const url = e["url"];
+            if (typeof url !== "string" || !url) {
+                fail(`${pfx}.url: required string`);
+            } else if (!/^https?:\/\//i.test(url) && !url.startsWith("file://")) {
+                fail(`${pfx}.url: must start with http://, https://, or file:// (got: ${url})`);
+            } else {
+                pass(`${pfx}.url: valid (${url})`);
+            }
+
+            // interval
+            const interval = e["interval"];
+            if (interval !== undefined) {
+                if (typeof interval !== "number" || interval <= 0) {
+                    fail(`${pfx}.interval: must be a positive number (got: ${interval})`);
+                } else {
+                    pass(`${pfx}.interval: ${interval}s`);
+                }
+            }
+
+            // schedule (5-field cron)
+            const schedule = e["schedule"];
+            if (schedule !== undefined) {
+                if (typeof schedule !== "string") {
+                    fail(`${pfx}.schedule: must be a string`);
+                } else {
+                    const fields = schedule.trim().split(/\s+/);
+                    if (fields.length !== 5) {
+                        fail(`${pfx}.schedule: must be a 5-field cron expression (got ${fields.length} field(s): "${schedule}")`);
+                    } else {
+                        pass(`${pfx}.schedule: "${schedule}"`);
+                    }
+                }
+            }
+
+            // diffMode
+            const diffMode = e["diffMode"];
+            if (diffMode !== undefined) {
+                if (!validDiffModes.has(String(diffMode))) {
+                    fail(`${pfx}.diffMode: must be one of ${[...validDiffModes].join(", ")} (got: ${diffMode})`);
+                } else {
+                    pass(`${pfx}.diffMode: ${diffMode}`);
+                }
+            }
+
+            // jsonPath
+            const jsonPath = e["jsonPath"];
+            if (jsonPath !== undefined) {
+                if (typeof jsonPath !== "string" || !jsonPath.startsWith("$")) {
+                    fail(`${pfx}.jsonPath: must start with '$' (got: ${jsonPath})`);
+                } else {
+                    pass(`${pfx}.jsonPath: ${jsonPath}`);
+                }
+            }
+
+            // webhooks
+            const webhooks = e["webhooks"];
+            if (webhooks !== undefined) {
+                if (!Array.isArray(webhooks)) {
+                    fail(`${pfx}.webhooks: must be an array`);
+                } else {
+                    let webhooksOk = true;
+                    for (const wh of webhooks as unknown[]) {
+                        if (typeof wh !== "string" || !/^https?:\/\//i.test(wh)) {
+                            fail(`${pfx}.webhooks: invalid URL "${wh}"`);
+                            webhooksOk = false;
+                        }
+                    }
+                    if (webhooksOk && webhooks.length > 0) pass(`${pfx}.webhooks: ${webhooks.length} URL(s) valid`);
+                }
+            }
+
+            // browser: check playwright importability
+            const browser = e["browser"];
+            if (browser === true) {
+                try {
+                    await import("playwright");
+                    pass(`${pfx}.browser: playwright is available`);
+                } catch {
+                    fail(`${pfx}.browser: true but playwright is not installed. Run: npm install playwright`);
+                }
+            }
+        }
+
+        console.log();
+        if (allPassed) {
+            console.log(chalk.green("All checks passed."));
+            process.exit(0);
+        } else {
+            console.log(chalk.red("Some checks failed."));
+            process.exit(1);
+        }
+    });
+
+// ---------------------------------------------------------------------------
 // init
 // ---------------------------------------------------------------------------
 

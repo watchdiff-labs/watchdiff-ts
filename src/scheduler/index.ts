@@ -20,8 +20,10 @@ import { generateAiSummary, aiSummaryEnabled, getProvider, AiError } from "../ai
 import {
     reportHasChanges,
     reportSummary,
+    type ActiveBetween,
     type DiffReport,
     type IStore,
+    type MaintenanceWindow,
     type SilenceInfo,
     type SpikeInfo,
     type StatusChangeInfo,
@@ -37,18 +39,114 @@ export type GlobalCallback = (report: DiffReport) => void | Promise<void>;
 
 // Per-URL runtime state
 interface UrlState {
-    lastCheckAt:       Date | null;
-    nextCheckAt:       Date | null;
-    lastChangeAt:      Date | null;
-    checksCount:       number;
-    changesCount:      number;
-    errorsCount:       number;
-    paused:            boolean;
-    lastAlertAt:       number;
-    lastSilenceAt:     number;
-    recentChangeTimes: number[];
-    lastSpikeAt:       number;
-    lastStatusCode:    number;
+    lastCheckAt:              Date | null;
+    nextCheckAt:              Date | null;
+    lastChangeAt:             Date | null;
+    checksCount:              number;
+    changesCount:             number;
+    errorsCount:              number;
+    paused:                   boolean;
+    lastAlertAt:              number;
+    lastSilenceAt:            number;
+    recentChangeTimes:        number[];
+    lastSpikeAt:              number;
+    lastStatusCode:           number;
+    /** Consecutive fetch/parse error count (for failurePolicy). */
+    consecutiveFailureCount:  number;
+    /** Consecutive success count after a failure period (for failurePolicy recovery). */
+    consecutiveSuccessCount:  number;
+    /** Whether alerts are suppressed due to failure policy (waiting for recovery). */
+    alertsSuppressedByPolicy: boolean;
+    /** Timestamp (ms) after which the next check may proceed (for Retry-After). */
+    retryAfterUntil:          number;
+    /** Whether currently inside a maintenance window. */
+    inMaintenance:            boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Semaphore
+// ---------------------------------------------------------------------------
+
+class Semaphore {
+    private running = 0;
+    private readonly queue: Array<() => void> = [];
+
+    constructor(private readonly limit: number) {}
+
+    async acquire(): Promise<void> {
+        if (this.running < this.limit) {
+            this.running++;
+            return;
+        }
+        await new Promise<void>((resolve) => this.queue.push(resolve));
+        this.running++;
+    }
+
+    release(): void {
+        this.running--;
+        const next = this.queue.shift();
+        if (next) next();
+    }
+
+    async run<T>(fn: () => Promise<T>): Promise<T> {
+        await this.acquire();
+        try {
+            return await fn();
+        } finally {
+            this.release();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Active-hours helpers
+// ---------------------------------------------------------------------------
+
+function isInActiveBetween(activeBetween: ActiveBetween): boolean {
+    const tz       = activeBetween.timezone ?? "UTC";
+    const now      = new Date();
+
+    // Get local time parts using Intl.DateTimeFormat
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: tz,
+        hour:     "2-digit",
+        minute:   "2-digit",
+        hour12:   false,
+        weekday:  "long",
+    }).formatToParts(now);
+
+    const hourPart   = parts.find((p) => p.type === "hour")?.value   ?? "00";
+    const minutePart = parts.find((p) => p.type === "minute")?.value ?? "00";
+    const weekday    = (parts.find((p) => p.type === "weekday")?.value ?? "").toLowerCase() as
+        "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday";
+
+    const currentTime = `${hourPart.padStart(2, "0")}:${minutePart.padStart(2, "0")}`;
+
+    // Check day of week
+    if (activeBetween.days && activeBetween.days.length > 0) {
+        if (!activeBetween.days.includes(weekday)) return false;
+    }
+
+    // Check time window
+    const from = activeBetween.from;
+    const to   = activeBetween.to;
+
+    if (from <= to) {
+        // Normal window: e.g. 09:00 - 18:00
+        return currentTime >= from && currentTime <= to;
+    } else {
+        // Overnight window: e.g. 22:00 - 06:00
+        return currentTime >= from || currentTime <= to;
+    }
+}
+
+function isInMaintenanceWindow(windows: MaintenanceWindow[]): boolean {
+    const now = Date.now();
+    return windows.some((w) => {
+        const from = new Date(w.from).getTime();
+        const to   = new Date(w.to).getTime();
+        return now >= from && now <= to;
+    });
 }
 
 const NUMBERS_PATTERN = /\b\d+(\.\d+)?\b/g;
@@ -65,9 +163,14 @@ export class Scheduler {
     private readonly urlStates                                  = new Map<string, UrlState>();
     /** URLs where AI was permanently disabled (invalid key / bad model). */
     private readonly aiDisabled                                 = new Set<string>();
+    private readonly semaphore:   Semaphore | null;
     private configs: WatchConfig[]                              = [];
 
-    constructor(private readonly store: IStore) { }
+    constructor(private readonly store: IStore, concurrency?: number) {
+        this.semaphore = concurrency !== undefined && concurrency > 0
+            ? new Semaphore(concurrency)
+            : null;
+    }
 
     addGlobalCallback(cb: GlobalCallback): void {
         this.globalCallbacks.push(cb);
@@ -88,14 +191,14 @@ export class Scheduler {
 
             if (config.schedule) {
                 console.info(`[watchdiff] Starting watcher for ${config.label} (schedule=${config.schedule})`);
-                void this.check(config);
+                void this.runCheck(config);
                 this.scheduleCron(config);
             } else {
                 console.info(`[watchdiff] Starting watcher for ${config.label} (interval=${config.interval}s)`);
-                void this.check(config);
+                void this.runCheck(config);
                 const timer = setInterval(() => {
                     if (!this.getState(config).paused) {
-                        void this.check(config);
+                        void this.runCheck(config);
                     }
                 }, this.effectiveInterval(config) * 1000);
 
@@ -117,7 +220,7 @@ export class Scheduler {
 
         const timer = setTimeout(() => {
             if (!this.getState(config).paused) {
-                void this.check(config).then(() => {
+                void this.runCheck(config).then(() => {
                     this.scheduleCron(config);
                 });
             } else {
@@ -128,6 +231,43 @@ export class Scheduler {
         if (typeof timer === "object" && "unref" in timer) {
             (timer as NodeJS.Timeout).unref();
         }
+    }
+
+    /** Wrapper that applies semaphore + maintenance/active-hours skip logic before check(). */
+    private async runCheck(config: WatchConfig): Promise<DiffReport | null> {
+        const state = this.getState(config);
+
+        // Retry-After: skip if still within delay window
+        if (state.retryAfterUntil > Date.now()) {
+            const remainingSec = Math.ceil((state.retryAfterUntil - Date.now()) / 1000);
+            console.debug(`[${config.label}] Skipping check - Retry-After delay active (${remainingSec}s remaining).`);
+            return null;
+        }
+
+        // Maintenance window check
+        if (config.maintenanceWindows && config.maintenanceWindows.length > 0) {
+            const inMaintenance = isInMaintenanceWindow(config.maintenanceWindows);
+            state.inMaintenance = inMaintenance;
+            if (inMaintenance) {
+                console.debug(`[${config.label}] Skipping check - inside maintenance window.`);
+                return null;
+            }
+        } else {
+            state.inMaintenance = false;
+        }
+
+        // Active-between check
+        if (config.activeBetween) {
+            if (!isInActiveBetween(config.activeBetween)) {
+                console.debug(`[${config.label}] Skipping check - outside active hours.`);
+                return null;
+            }
+        }
+
+        if (this.semaphore) {
+            return this.semaphore.run(() => this.check(config));
+        }
+        return this.check(config);
     }
 
     stop(): void {
@@ -141,26 +281,26 @@ export class Scheduler {
     /** Run a single check and return the DiffReport (or null on first run / error). */
     async checkOnce(config: WatchConfig): Promise<DiffReport | null> {
         this.initState(config);
-        return this.check(config);
+        return this.runCheck(config);
     }
 
     // ------------------------------------------------------------------
     // Pause / Resume
     // ------------------------------------------------------------------
 
-    pause(url: string): void {
-        const state = this.urlStates.get(url);
+    pause(urlOrId: string): void {
+        const state = this.urlStates.get(urlOrId);
         if (state) {
             state.paused = true;
-            console.info(`[watchdiff] Paused watcher for ${url}`);
+            console.info(`[watchdiff] Paused watcher for ${urlOrId}`);
         }
     }
 
-    resume(url: string): void {
-        const state = this.urlStates.get(url);
+    resume(urlOrId: string): void {
+        const state = this.urlStates.get(urlOrId);
         if (state) {
             state.paused = false;
-            console.info(`[watchdiff] Resumed watcher for ${url}`);
+            console.info(`[watchdiff] Resumed watcher for ${urlOrId}`);
         }
     }
 
@@ -170,16 +310,18 @@ export class Scheduler {
 
     getStatuses(configs: WatchConfig[]): WatcherStatus[] {
         return configs.map((config) => {
-            const state = this.urlStates.get(config.url) ?? this.makeEmptyState();
+            const state = this.urlStates.get(this.stateKey(config)) ?? this.makeEmptyState();
             return {
-                url:          config.url,
-                label:        config.label,
-                target:       config.target,
-                interval:     config.interval,
-                paused:       state.paused,
-                lastCheckAt:  state.lastCheckAt,
-                nextCheckAt:  state.nextCheckAt,
-                lastChangeAt: state.lastChangeAt,
+                url:            config.url,
+                id:             config.id,
+                label:          config.label,
+                target:         config.target,
+                interval:       config.interval,
+                paused:         state.paused,
+                inMaintenance:  state.inMaintenance,
+                lastCheckAt:    state.lastCheckAt,
+                nextCheckAt:    state.nextCheckAt,
+                lastChangeAt:   state.lastChangeAt,
                 checksCount:    state.checksCount,
                 changesCount:   state.changesCount,
                 errorsCount:    state.errorsCount,
@@ -192,31 +334,42 @@ export class Scheduler {
     // Internal
     // ------------------------------------------------------------------
 
+    /** Returns the canonical identity key for a config (id takes priority over url). */
+    private stateKey(config: WatchConfig): string {
+        return config.id ?? config.url;
+    }
+
     private initState(config: WatchConfig): void {
-        if (!this.urlStates.has(config.url)) {
-            this.urlStates.set(config.url, this.makeEmptyState());
+        const key = this.stateKey(config);
+        if (!this.urlStates.has(key)) {
+            this.urlStates.set(key, this.makeEmptyState());
         }
     }
 
     private makeEmptyState(): UrlState {
         return {
-            lastCheckAt:       null,
-            nextCheckAt:       null,
-            lastChangeAt:      null,
-            checksCount:       0,
-            changesCount:      0,
-            errorsCount:       0,
-            paused:            false,
-            lastAlertAt:       0,
-            lastSilenceAt:     0,
-            recentChangeTimes: [],
-            lastSpikeAt:       0,
-            lastStatusCode:    0,
+            lastCheckAt:              null,
+            nextCheckAt:              null,
+            lastChangeAt:             null,
+            checksCount:              0,
+            changesCount:             0,
+            errorsCount:              0,
+            paused:                   false,
+            lastAlertAt:              0,
+            lastSilenceAt:            0,
+            recentChangeTimes:        [],
+            lastSpikeAt:              0,
+            lastStatusCode:           0,
+            consecutiveFailureCount:  0,
+            consecutiveSuccessCount:  0,
+            alertsSuppressedByPolicy: false,
+            retryAfterUntil:          0,
+            inMaintenance:            false,
         };
     }
 
     private getState(config: WatchConfig): UrlState {
-        return this.urlStates.get(config.url) ?? this.makeEmptyState();
+        return this.urlStates.get(this.stateKey(config)) ?? this.makeEmptyState();
     }
 
     private async handleStatusChange(state: UrlState, currentStatus: number, config: WatchConfig, now: number): Promise<void> {
@@ -304,6 +457,8 @@ export class Scheduler {
             }
         } catch (err) {
             state.errorsCount++;
+            state.consecutiveFailureCount++;
+            state.consecutiveSuccessCount = 0;
             const fetchErr      = err instanceof FetchError ? err : null;
             const currentStatus = fetchErr?.statusCode ?? 0;
 
@@ -320,13 +475,37 @@ export class Scheduler {
                 }
             }
 
-            const error = err instanceof Error ? err : new Error(String(err));
-            if (config.onError) {
-                try { config.onError(error, config); } catch (cbErr) {
-                    console.error(`[${config.label}] onError callback threw:`, cbErr);
+            // Failure policy: Retry-After header support
+            if (
+                config.failurePolicy?.respectRetryAfter &&
+                fetchErr &&
+                (currentStatus === 429 || currentStatus === 503) &&
+                fetchErr.retryAfter
+            ) {
+                const delaySec = parseRetryAfter(fetchErr.retryAfter);
+                if (delaySec > 0) {
+                    state.retryAfterUntil = Date.now() + delaySec * 1000;
+                    console.debug(`[${config.label}] Retry-After: waiting ${delaySec}s before next check.`);
+                }
+            }
+
+            // Failure policy: only fire onError after consecutiveFailures threshold
+            const threshold = config.failurePolicy?.consecutiveFailures ?? 1;
+            if (state.consecutiveFailureCount >= threshold) {
+                const error = err instanceof Error ? err : new Error(String(err));
+                if (config.onError) {
+                    try { config.onError(error, config); } catch (cbErr) {
+                        console.error(`[${config.label}] onError callback threw:`, cbErr);
+                    }
+                } else {
+                    console.error(`[${config.label}] Fetch failed:`, error.message);
+                }
+                // Suppress further alerts until recovery
+                if (state.consecutiveFailureCount === threshold) {
+                    state.alertsSuppressedByPolicy = true;
                 }
             } else {
-                console.error(`[${config.label}] Fetch failed:`, error.message);
+                console.debug(`[${config.label}] Fetch failed (failure ${state.consecutiveFailureCount}/${threshold} before alert).`);
             }
             state.lastCheckAt = new Date();
             return null;
@@ -402,7 +581,23 @@ export class Scheduler {
             }
         }
 
-        // 4. Compare
+        // 4. Failure policy - track recovery after errors
+        if (state.consecutiveFailureCount > 0) {
+            state.consecutiveSuccessCount++;
+            const requiredSuccesses = config.failurePolicy?.recoveryChecks ?? 1;
+            if (state.consecutiveSuccessCount >= requiredSuccesses) {
+                state.consecutiveFailureCount  = 0;
+                state.consecutiveSuccessCount  = 0;
+                state.alertsSuppressedByPolicy = false;
+                console.info(`[${config.label}] Recovered after failures - alerts re-enabled.`);
+            } else {
+                console.debug(
+                    `[${config.label}] Recovery check ${state.consecutiveSuccessCount}/${requiredSuccesses} - alerts still suppressed.`
+                );
+            }
+        }
+
+        // 5. Compare
         const previous = this.store.loadLatest(config.url, config.target);
         state.lastCheckAt = new Date();
 
@@ -527,6 +722,12 @@ export class Scheduler {
             // alertIf - custom condition gate
             if (config.alertIf && !config.alertIf(report)) {
                 console.debug(`[${config.label}] alertIf returned false - alert suppressed.`);
+                return report;
+            }
+
+            // Failure policy: suppress alerts during recovery period
+            if (state.alertsSuppressedByPolicy) {
+                console.debug(`[${config.label}] Alert suppressed - waiting for failure policy recovery.`);
                 return report;
             }
 
@@ -737,6 +938,12 @@ export class Scheduler {
             return;
         }
 
+        // Failure policy: suppress alerts during recovery period
+        if (state.alertsSuppressedByPolicy) {
+            console.debug(`[${config.label}] Alert suppressed - waiting for failure policy recovery.`);
+            return;
+        }
+
         if (aiSummaryEnabled(config) && !this.aiDisabled.has(config.url)) {
             try {
                 report.aiSummary = await generateAiSummary(report, getProvider(config) ?? undefined, config.aiPrompt) ?? undefined;
@@ -770,4 +977,26 @@ export class Scheduler {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a Retry-After header value.
+ * Accepts either a delta-seconds integer or an HTTP-date string.
+ * Returns delay in seconds (0 if unparseable).
+ */
+function parseRetryAfter(value: string): number {
+    const trimmed = value.trim();
+    const asNum   = Number(trimmed);
+    if (!isNaN(asNum) && asNum >= 0) return asNum;
+
+    // Try HTTP-date parsing
+    const date = new Date(trimmed);
+    if (!isNaN(date.getTime())) {
+        return Math.max(0, Math.ceil((date.getTime() - Date.now()) / 1000));
+    }
+    return 0;
 }

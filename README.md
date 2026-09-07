@@ -26,6 +26,12 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 - **JSON path targeting** - diff only a specific field inside a JSON API response
 - **Cookie-based authentication** - pass session cookies to monitor login-protected pages
 - **Email alerts** - send SMTP email notifications on change (requires nodemailer)
+- **Stable watcher ID** - assign a stable `id` key per watcher; targeted `pause(id)` / `resume(id)` even when multiple watchers share the same URL
+- **Concurrency limiting** - cap simultaneous in-flight checks with `new WatchDiff({ concurrency: 5 })` to avoid overwhelming targets
+- **Maintenance windows** - automatically skip checks during scheduled downtime — no code changes needed at runtime
+- **Active hours** - restrict monitoring to specific hours/days of the week, with full IANA timezone support
+- **Failure policy** - require N consecutive failures before alerting, and N consecutive successes before re-enabling alerts after recovery
+- **Config validation** - `watchdiff validate` checks a config file for errors (invalid URLs, unknown modes, bad cron expressions) before deploying
 - **HTML archiving** - save full page HTML to disk on every change
 - **Screenshot on change** - capture a PNG via Playwright on every detected change
 - **HTTP status monitoring** - alert when a URL returns a different status code (200 → 503, 503 → 200)
@@ -95,6 +101,12 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 | Watch one JSON field only | `jsonPath: "$.data.price"` |
 | Monitor authenticated pages | `cookies: { session: "abc123", csrftoken: "xyz" }` |
 | Send email on change | `alert: { email: { to: "...", smtp: { host, port, user, pass } } }` (requires nodemailer) |
+| Give a watcher a stable ID | `id: "my-watcher"` then `wd.pause("my-watcher")` / `wd.resume("my-watcher")` |
+| Limit concurrent checks | `new WatchDiff({ concurrency: 5 })` |
+| Skip checks during scheduled downtime | `maintenanceWindows: [{ from: "2026-09-01T02:00:00Z", to: "2026-09-01T04:00:00Z" }]` |
+| Restrict monitoring to business hours | `activeBetween: { from: "09:00", to: "18:00", days: ["monday","friday"] }` |
+| Require 3 failures before alerting | `failurePolicy: { consecutiveFailures: 3 }` |
+| Validate config before deploying | `watchdiff validate` or `watchdiff validate --config my.json` |
 | Diff two URLs | `wd.compareUrls(urlA, urlB)` or `watchdiff compare <urlA> <urlB>` |
 | Expose status over HTTP | `wd.startStatusServer(9090)` or `--status-port 9090` |
 | CLI one-liner | `watchdiff run https://example.com --target .price --interval 60` |
@@ -143,12 +155,18 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
   - [JSON path targeting](#json-path-targeting)
   - [Cookie-based authentication](#cookie-based-authentication)
   - [Email alerts](#email-alerts)
+  - [Stable watcher ID](#stable-watcher-id)
+  - [Concurrency limiting](#concurrency-limiting)
+  - [Maintenance windows](#maintenance-windows)
+  - [Active hours](#active-hours)
+  - [Failure policy](#failure-policy)
   - [URL comparison](#url-comparison)
   - [Status server](#status-server)
   - [SQLite storage backend](#sqlite-storage-backend)
   - [CSV and XLSX export](#csv-and-xlsx-export)
   - [Config file](#watchdiff-init---config-file)
   - [Environment variables](#environment-variables)
+  - [Validate config](#validate-config)
 - [Types](#types)
 - [Helper functions](#helper-functions)
 - [CLI reference](#cli)
@@ -262,15 +280,29 @@ DbFetcher (SQLite / PostgreSQL / MySQL) -> DbDiffEngine -> Store -> callbacks / 
 
 ## API
 
-### `new WatchDiff(storageDir?, store?)`
+### `new WatchDiff(opts?)`
 
 ```typescript
-const wd = new WatchDiff(".watchdiff");  // default: JSON storage
+// Default JSON storage
+const wd = new WatchDiff();
+
+// Options object (recommended)
+const wd = new WatchDiff({ storageDir: ".watchdiff", concurrency: 10 });
 
 // With SQLite backend (optional - requires better-sqlite3)
 import { SqliteStore } from "watchdiff-core";
+const wd = new WatchDiff({ store: new SqliteStore(".watchdiff.db") });
+
+// Backward-compatible string form (still supported)
+const wd = new WatchDiff(".watchdiff");
 const wd = new WatchDiff(undefined, new SqliteStore(".watchdiff.db"));
 ```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `storageDir` | `string` | `".watchdiff"` | Directory for JSON snapshot storage |
+| `store` | `IStore` | - | Custom store (e.g. `SqliteStore`). Overrides `storageDir` |
+| `concurrency` | `number` | unlimited | Max simultaneous in-flight checks. See [Concurrency limiting](#concurrency-limiting) |
 
 
 ### `.watch(url, options?)` - chainable
@@ -324,6 +356,10 @@ Register a URL to monitor.
 | `confirmAfter` | `number` | - | Re-verify after N seconds before alerting (flapping detection) |
 | `jsonPath` | `string` | - | JSON path expression to extract a sub-value before diffing (e.g. `"$.data.price"`) |
 | `cookies` | `Record<string, string>` | - | Cookies sent with every request — merged into the `Cookie` header (e.g. `{ session: "abc" }`) |
+| `id` | `string` | - | Stable identity key for this watcher. Used for `pause(id)` / `resume(id)` and storage keys instead of URL |
+| `maintenanceWindows` | `MaintenanceWindow[]` | - | Time windows during which checks are skipped entirely |
+| `activeBetween` | `ActiveBetween` | - | Restrict monitoring to specific hours and/or days of the week |
+| `failurePolicy` | `FailurePolicy` | - | Control how many consecutive failures/recoveries are needed before alerting |
 
 ```typescript
 wd
@@ -377,18 +413,22 @@ if (report) console.log(reportSummary(report));
 ```
 
 
-### `.pause(url)` / `.resume(url)`
+### `.pause(urlOrId)` / `.resume(urlOrId)`
 
 Suspend or resume a watcher at runtime without stopping the scheduler.
+Pass the watcher's `id` (if set) or its URL.
 
 ```typescript
 const stop = wd.start();
 
-// Pause during maintenance window
+// Pause by URL
 wd.pause("https://example.com");
 
+// Pause by stable ID (when id is set in .watch())
+wd.pause("my-watcher");
+
 // Resume later
-setTimeout(() => wd.resume("https://example.com"), 30_000);
+setTimeout(() => wd.resume("my-watcher"), 30_000);
 ```
 
 
@@ -407,17 +447,19 @@ Returns an array of `WatcherStatus`:
 
 ```typescript
 interface WatcherStatus {
-  url:          string;
-  label:        string;
-  target:       string | undefined;
-  interval:     number;
-  paused:       boolean;
-  lastCheckAt:  Date | null;
-  nextCheckAt:  Date | null;
-  lastChangeAt: Date | null;
-  checksCount:  number;
-  changesCount: number;
-  errorsCount:  number;
+  url:           string;
+  id?:           string;        // set when id was configured
+  label:         string;
+  target:        string | undefined;
+  interval:      number;
+  paused:        boolean;
+  inMaintenance: boolean;       // true when inside a maintenanceWindow
+  lastCheckAt:   Date | null;
+  nextCheckAt:   Date | null;
+  lastChangeAt:  Date | null;
+  checksCount:   number;
+  changesCount:  number;
+  errorsCount:   number;
 }
 ```
 
@@ -1254,7 +1296,147 @@ type DbChangeKind =
   | "value_changed";    // tracked value changed (value mode)
 ```
 
-### URL comparison
+### Stable watcher ID
+
+Assign a stable `id` to a watcher. The ID is used as the storage key and as the argument to `pause()` / `resume()` — letting you target a specific watcher even when multiple watchers share the same URL.
+
+```typescript
+wd
+  .watch("https://example.com/product", { id: "product-price", target: ".price" })
+  .watch("https://example.com/product", { id: "product-stock", target: ".stock" });
+
+// Pause only the price watcher
+wd.pause("product-price");
+
+// Resume it later
+wd.resume("product-price");
+```
+
+Without `id`, `pause(url)` pauses **all** watchers for that URL. With `id`, each watcher is independent.
+
+```typescript
+// Status reflects the id
+const statuses = wd.status();
+// [{ id: "product-price", url: "...", paused: true, ... }, ...]
+```
+
+
+## Concurrency limiting
+
+Cap the number of simultaneous in-flight checks. Useful when monitoring many URLs to avoid overwhelming a single server or hitting rate limits.
+
+```typescript
+// At most 5 checks running at the same time
+const wd = new WatchDiff({ concurrency: 5 });
+
+wd.watch("https://site.com/page-1", { interval: 30 });
+wd.watch("https://site.com/page-2", { interval: 30 });
+// ... 50 more watches
+wd.start();
+```
+
+Without `concurrency`, all due checks fire simultaneously. With it, excess checks queue behind a semaphore and run as slots free up.
+
+```typescript
+import { WatchDiff, SqliteStore } from "watchdiff-core";
+
+const wd = new WatchDiff({ concurrency: 10, store: new SqliteStore(".watchdiff.db") });
+```
+
+
+## Maintenance windows
+
+Automatically skip checks during known downtime windows — no code change needed at runtime.
+
+```typescript
+wd.watch("https://example.com", {
+  interval: 60,
+  maintenanceWindows: [
+    // Nightly maintenance 2am–4am UTC on 2026-09-15
+    { from: "2026-09-15T02:00:00Z", to: "2026-09-15T04:00:00Z" },
+    // A longer planned outage
+    { from: new Date("2026-10-01T00:00:00Z"), to: new Date("2026-10-01T06:00:00Z") },
+  ],
+  onChange: (report) => console.log(report.changes),
+});
+```
+
+While the current time is inside any window, the check is silently skipped and `status()` reports `inMaintenance: true`. The window is evaluated fresh on each tick, so no restart is needed after the window passes.
+
+```typescript
+interface MaintenanceWindow {
+  from: string | Date;   // ISO string or Date
+  to:   string | Date;
+}
+```
+
+
+## Active hours
+
+Restrict monitoring to specific hours and days of the week. Checks are skipped outside the defined window, with full IANA timezone support.
+
+```typescript
+// Monitor only during business hours in Paris time
+wd.watch("https://example.com", {
+  interval: 60,
+  activeBetween: {
+    timezone: "Europe/Paris",
+    days:     ["monday", "tuesday", "wednesday", "thursday", "friday"],
+    from:     "09:00",
+    to:       "18:00",
+  },
+});
+
+// Monitor 24/7 but skip nights (UTC)
+wd.watch("https://api.example.com/stock", {
+  interval: 30,
+  activeBetween: { from: "07:00", to: "22:00" },
+});
+```
+
+`days` defaults to all 7 days when omitted. `timezone` defaults to UTC when omitted. Time comparison uses `Intl.DateTimeFormat` — no extra dependency.
+
+```typescript
+interface ActiveBetween {
+  timezone?: string;  // IANA timezone, e.g. "Europe/Paris". Default: UTC
+  days?:     Array<"monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday">;
+  from:      string;  // HH:MM, e.g. "09:00"
+  to:        string;  // HH:MM, e.g. "18:00"
+}
+```
+
+
+## Failure policy
+
+Control how many consecutive fetch failures must occur before `onError` and alerts fire, and how many consecutive successes are needed before re-enabling alerts after a failure streak. Optionally honour the `Retry-After` header on 429/503 responses.
+
+```typescript
+wd.watch("https://example.com", {
+  failurePolicy: {
+    consecutiveFailures: 3,   // alert only after 3 failures in a row (default: 1)
+    recoveryChecks:      2,   // require 2 successes in a row to clear the failure state (default: 1)
+    respectRetryAfter:   true, // honour Retry-After header on 429 / 503
+  },
+  onError: (err) => console.error("Persistent failure:", err.message),
+});
+```
+
+Without `failurePolicy`, the first fetch error fires `onError` immediately. With it:
+- Errors below the threshold are silently swallowed (no alert, no callback).
+- After `consecutiveFailures` errors in a row, the alert fires once and is then suppressed until recovery.
+- Recovery requires `recoveryChecks` consecutive successful fetches.
+- When `respectRetryAfter: true` and the server responds with a `Retry-After` header, the next check for that watcher is postponed until the header deadline.
+
+```typescript
+interface FailurePolicy {
+  consecutiveFailures?: number;   // default 1
+  recoveryChecks?:      number;   // default 1
+  respectRetryAfter?:   boolean;  // default false
+}
+```
+
+
+## URL comparison
 
 Compare two arbitrary URLs on the spot without any persistent storage. Useful for comparing
 staging vs production, two versions of a page, or two different APIs.
@@ -1476,6 +1658,16 @@ watchdiff run --config /etc/watchdiff.config.json
 ```
 
 
+### Validate config
+
+Run `watchdiff validate` to check a config file for common errors before deploying. See the [CLI section](#validate---validate-config-file) for full details.
+
+```bash
+watchdiff validate                    # validates watchdiff.config.json
+watchdiff validate --config my.json   # validates a specific file
+```
+
+
 ## Types
 
 ### `DiffReport`
@@ -1520,17 +1712,59 @@ interface Snapshot {
 
 ```typescript
 interface WatcherStatus {
-  url:          string;
-  label:        string;
-  target:       string | undefined;
-  interval:     number;
-  paused:       boolean;
-  lastCheckAt:  Date | null;
-  nextCheckAt:  Date | null;
-  lastChangeAt: Date | null;
-  checksCount:  number;
-  changesCount: number;
-  errorsCount:  number;
+  url:           string;
+  id?:           string;        // set when id was configured
+  label:         string;
+  target:        string | undefined;
+  interval:      number;
+  paused:        boolean;
+  inMaintenance: boolean;       // true when inside a maintenanceWindow
+  lastCheckAt:   Date | null;
+  nextCheckAt:   Date | null;
+  lastChangeAt:  Date | null;
+  checksCount:   number;
+  changesCount:  number;
+  errorsCount:   number;
+}
+```
+
+### `WatchDiffOptions`
+
+```typescript
+interface WatchDiffOptions {
+  storageDir?:  string;    // storage directory (default ".watchdiff")
+  store?:       IStore;    // custom store — overrides storageDir
+  concurrency?: number;    // max simultaneous in-flight checks (default: unlimited)
+}
+```
+
+### `MaintenanceWindow`
+
+```typescript
+interface MaintenanceWindow {
+  from: string | Date;   // ISO string or Date — start of window
+  to:   string | Date;   // ISO string or Date — end of window
+}
+```
+
+### `ActiveBetween`
+
+```typescript
+interface ActiveBetween {
+  timezone?: string;  // IANA timezone (e.g. "Europe/Paris"). Default: UTC
+  days?:     Array<"monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday" | "sunday">;
+  from:      string;  // HH:MM start of active window (e.g. "09:00")
+  to:        string;  // HH:MM end of active window (e.g. "18:00")
+}
+```
+
+### `FailurePolicy`
+
+```typescript
+interface FailurePolicy {
+  consecutiveFailures?: number;   // failures in a row before alerting (default 1)
+  recoveryChecks?:      number;   // successes in a row before clearing failure state (default 1)
+  respectRetryAfter?:   boolean;  // honour Retry-After header on 429/503 (default false)
 }
 ```
 
@@ -1949,6 +2183,30 @@ watchdiff db sqlite://./app.db products --json
 watchdiff init                    # creates watchdiff.config.json
 watchdiff init --force            # overwrite existing config
 ```
+
+### `validate` - validate config file
+
+Check a config file for errors before deploying. Exits with code 0 on success, 1 on failure.
+
+```bash
+# Validate watchdiff.config.json in the current directory
+watchdiff validate
+
+# Validate a specific file
+watchdiff validate --config my.json
+
+# Machine-readable JSON output
+watchdiff validate --json
+```
+
+Checks performed:
+- All URLs are valid (start with `http://` or `https://`)
+- `interval` is a positive integer
+- `schedule` is a valid 5-field cron expression when set
+- `diffMode` is one of `line`, `word`, `semantic`, `json`, `rss`
+- `jsonPath` starts with `$` when set
+- All `webhooks` are valid URLs
+- `playwright` is importable when `browser: true` is used
 
 ### `clear` - delete stored data
 

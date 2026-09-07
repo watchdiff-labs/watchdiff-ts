@@ -11,7 +11,7 @@
  */
 
 export { WatchDiff } from "./core.js";
-export type { WatchOptions, WatchFileOptions, WatchApiOptions, WatchCertOptions, DbWatchOptions, WatchSitemapOptions } from "./core.js";
+export type { WatchDiffOptions, WatchOptions, WatchFileOptions, WatchApiOptions, WatchCertOptions, DbWatchOptions, WatchSitemapOptions } from "./core.js";
 
 export {
     makeWatchConfig,
@@ -31,6 +31,9 @@ export type {
     SmtpConfig,
     EmailConfig,
     IStore,
+    MaintenanceWindow,
+    ActiveBetween,
+    FailurePolicy,
     WatchConfig,
     Snapshot,
     Change,

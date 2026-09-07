@@ -23,6 +23,9 @@ const BASE_HEADERS: Record<string, string> = {
 };
 
 export class FetchError extends Error {
+    /** Retry-After header value (seconds or HTTP-date), set on 429/503 responses. */
+    public retryAfter?: string;
+
     constructor(
         message: string,
         public readonly statusCode?: number
@@ -34,13 +37,18 @@ export class FetchError extends Error {
 
 export class Fetcher {
     async fetch(config: WatchConfig): Promise<string> {
+        const result = await this.fetchWithHeaders(config);
+        return result.html;
+    }
+
+    async fetchWithHeaders(config: WatchConfig): Promise<{ html: string; headers: Record<string, string> }> {
         const maxAttempts   = 1 + (config.retries ?? 0);
         const baseDelay     = config.retryDelay ?? 1_000;
         let lastErr: FetchError | undefined;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
-                return await this.attemptFetch(config);
+                return await this.attemptFetchWithHeaders(config);
             } catch (err) {
                 lastErr = err instanceof FetchError ? err : new FetchError(String(err));
 
@@ -57,12 +65,12 @@ export class Fetcher {
         throw lastErr!;
     }
 
-    private async attemptFetch(config: WatchConfig): Promise<string> {
+    private async attemptFetchWithHeaders(config: WatchConfig): Promise<{ html: string; headers: Record<string, string> }> {
         const userAgent  = pickRandom(config.userAgents ?? []) ?? pickRandom([...DEFAULT_USER_AGENTS]) ?? FALLBACK_UA;
-        const headers: Record<string, string> = { ...BASE_HEADERS, "User-Agent": userAgent, ...config.headers };
+        const reqHeaders: Record<string, string> = { ...BASE_HEADERS, "User-Agent": userAgent, ...config.headers };
         if (config.cookies && Object.keys(config.cookies).length > 0) {
-            const existing = headers["Cookie"] ? headers["Cookie"] + "; " : "";
-            headers["Cookie"] = existing + Object.entries(config.cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+            const existing = reqHeaders["Cookie"] ? reqHeaders["Cookie"] + "; " : "";
+            reqHeaders["Cookie"] = existing + Object.entries(config.cookies).map(([k, v]) => `${k}=${v}`).join("; ");
         }
         const controller = new AbortController();
         const timer      = setTimeout(() => controller.abort(), config.timeout);
@@ -71,21 +79,31 @@ export class Fetcher {
             const proxy = pickRandom(config.proxies ?? []);
 
             const response = proxy
-                ? await this.fetchWithProxy(config.url, headers, controller.signal, proxy)
+                ? await this.fetchWithProxy(config.url, reqHeaders, controller.signal, proxy)
                 : await globalThis.fetch(config.url, {
-                    headers,
+                    headers:  reqHeaders,
                     signal:   controller.signal,
                     redirect: "follow",
                 });
 
             if (!response.ok) {
-                throw new FetchError(
+                const fetchErr = new FetchError(
                     `HTTP ${response.status} for ${config.url}`,
                     response.status
                 );
+                if (response.status === 429 || response.status === 503) {
+                    const ra = response.headers.get("retry-after");
+                    if (ra) fetchErr.retryAfter = ra;
+                }
+                throw fetchErr;
             }
 
-            return await response.text();
+            const html = await response.text();
+            const responseHeaders: Record<string, string> = {};
+            response.headers.forEach((value, key) => {
+                responseHeaders[key.toLowerCase()] = value;
+            });
+            return { html, headers: responseHeaders };
         } catch (err) {
             if (err instanceof FetchError) throw err;
             if (err instanceof Error && err.name === "AbortError") {

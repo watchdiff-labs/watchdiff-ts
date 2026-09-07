@@ -13,11 +13,14 @@
 import {
     makeWatchConfig,
     reportSummary,
+    type ActiveBetween,
     type AlertConfig,
     type BrowserOptions,
     type DiffMode,
     type DiffReport,
+    type FailurePolicy,
     type IStore,
+    type MaintenanceWindow,
     type SilenceInfo,
     type SpikeInfo,
     type StatusChangeInfo,
@@ -54,6 +57,8 @@ import { Exporter }       from "./exporter/index.js";
 import { StatusServer }   from "./status-server/index.js";
 
 export interface WatchOptions {
+    /** Stable watcher identity key. Allows multiple watchers on the same URL and targeted pause/resume. */
+    id?: string;
     /** CSS selector or XPath expression - undefined = full page. */
     target?: string;
     /** Seconds between checks (default 300). */
@@ -146,6 +151,12 @@ export interface WatchOptions {
     jsonPath?: string;
     /** Custom prompt sent to the AI instead of the default template. */
     aiPrompt?: string | ((report: DiffReport) => string | Promise<string>);
+    /** Time windows during which checks are skipped entirely. */
+    maintenanceWindows?: MaintenanceWindow[];
+    /** Restrict monitoring to specific hours/days of the week. */
+    activeBetween?: ActiveBetween;
+    /** Policy controlling consecutive failures/recoveries before alerting. */
+    failurePolicy?: FailurePolicy;
 }
 
 export interface WatchFileOptions {
@@ -236,8 +247,18 @@ export interface DbWatchOptions {
     aiProvider?:     import("./ai-summarizer/index.js").AiProvider;
 }
 
+export interface WatchDiffOptions {
+    /** Directory for JSON storage (default ".watchdiff"). Ignored when a custom store is provided. */
+    storageDir?: string;
+    /** Custom store (e.g. SqliteStore). Overrides storageDir. */
+    store?: IStore;
+    /** Maximum number of simultaneous in-flight checks (default: unlimited). */
+    concurrency?: number;
+}
+
 export class WatchDiff {
     private readonly store: IStore;
+    private readonly concurrency: number | undefined;
     private readonly configs: WatchConfig[]                                                = [];
     private readonly dbConfigs: DbWatchConfig[]                                           = [];
     private readonly certConfigs: CertWatchConfig[]                                       = [];
@@ -254,12 +275,24 @@ export class WatchDiff {
     private statusServer:     StatusServer     | null = null;
 
     /**
-     * @param storageDir - Directory for JSON storage (default ".watchdiff").
-     *                     Ignored when a custom store is provided.
-     * @param store      - Custom store (e.g. SqliteStore). Overrides storageDir.
+     * @param optsOrStorageDir - WatchDiffOptions object, or storage dir string for backward compat.
+     * @param store            - Custom store (e.g. SqliteStore). Only used when first arg is a string.
+     *
+     * @example
+     *   new WatchDiff()                              // defaults
+     *   new WatchDiff(".watchdiff")                  // backward-compat string
+     *   new WatchDiff({ concurrency: 10 })           // options object
+     *   new WatchDiff({ storageDir: ".wd", store })  // full options
      */
-    constructor(storageDir = ".watchdiff", store?: IStore) {
-        this.store = store ?? new Store(storageDir);
+    constructor(optsOrStorageDir: WatchDiffOptions | string = ".watchdiff", store?: IStore) {
+        if (typeof optsOrStorageDir === "string") {
+            this.store       = store ?? new Store(optsOrStorageDir);
+            this.concurrency = undefined;
+        } else {
+            const opts       = optsOrStorageDir;
+            this.store       = opts.store ?? new Store(opts.storageDir ?? ".watchdiff");
+            this.concurrency = opts.concurrency;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -288,6 +321,7 @@ export class WatchDiff {
 
         this.configs.push(
             makeWatchConfig(url, {
+                id:                   opts.id,
                 target:               opts.target,
                 interval:             opts.interval,
                 label:                opts.label,
@@ -328,6 +362,9 @@ export class WatchDiff {
                 schedule:             opts.schedule,
                 confirmAfter:         opts.confirmAfter,
                 jsonPath:             opts.jsonPath,
+                maintenanceWindows:   opts.maintenanceWindows,
+                activeBetween:        opts.activeBetween,
+                failurePolicy:        opts.failurePolicy,
                 alert,
             })
         );
@@ -457,7 +494,7 @@ export class WatchDiff {
         }
 
         if (this.configs.length > 0) {
-            this.scheduler = new Scheduler(this.store);
+            this.scheduler = new Scheduler(this.store, this.concurrency);
             for (const cb of this.globalCallbacks) {
                 this.scheduler.addGlobalCallback(cb);
             }
@@ -536,13 +573,15 @@ export class WatchDiff {
     status(): WatcherStatus[] {
         if (!this.scheduler) {
             return this.configs.map((c) => ({
-                url:          c.url,
-                label:        c.label,
-                target:       c.target,
-                interval:     c.interval,
-                paused:       false,
-                lastCheckAt:  null,
-                nextCheckAt:  null,
+                url:            c.url,
+                id:             c.id,
+                label:          c.label,
+                target:         c.target,
+                interval:       c.interval,
+                paused:         false,
+                inMaintenance:  false,
+                lastCheckAt:    null,
+                nextCheckAt:    null,
                 lastChangeAt:   null,
                 checksCount:    0,
                 changesCount:   0,
