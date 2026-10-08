@@ -57,7 +57,7 @@ export class Fetcher {
 
                 if (isLast || !retryable) throw lastErr;
 
-                const delay = baseDelay * Math.pow(2, attempt - 1);
+                const delay = Math.min(baseDelay * Math.pow(2, attempt - 1), config.maxRetryDelay ?? Infinity);
                 await sleep(delay);
             }
         }

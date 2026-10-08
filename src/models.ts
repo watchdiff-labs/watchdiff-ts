@@ -221,6 +221,16 @@ export interface WatchConfig {
     activeBetween?: ActiveBetween;
     /** Policy controlling how many consecutive failures are needed before alerting. */
     failurePolicy?: FailurePolicy;
+    /** Called when a watcher recovers after a consecutive-failure streak. */
+    onRecovery?: (config: WatchConfig) => void;
+    /** Cap on exponential backoff delay in ms (default: Infinity). */
+    maxRetryDelay?: number;
+    /** Fire onChange on the very first snapshot capture (default false). */
+    alertOnFirstCheck?: boolean;
+    /** Extra headers merged into every outgoing webhook POST. */
+    webhookHeaders?: Record<string, string>;
+    /** Auto-delete snapshots older than N days after each save. */
+    retentionDays?: number;
 }
 
 export function makeWatchConfig(
@@ -276,6 +286,11 @@ export function makeWatchConfig(
         maintenanceWindows:     opts.maintenanceWindows,
         activeBetween:          opts.activeBetween,
         failurePolicy:          opts.failurePolicy,
+        onRecovery:             opts.onRecovery,
+        maxRetryDelay:          opts.maxRetryDelay,
+        alertOnFirstCheck:      opts.alertOnFirstCheck,
+        webhookHeaders:         opts.webhookHeaders,
+        retentionDays:          opts.retentionDays,
     };
 }
 

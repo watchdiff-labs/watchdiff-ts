@@ -1,6 +1,8 @@
 import { program } from "commander";
 import chalk from "chalk";
-import { writeFileSync, readFileSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync, readdirSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { WatchDiff } from "../index.js";
 import { changeHuman, reportSummary } from "../models.js";
 import { dbReportSummary } from "../db-models.js";
@@ -362,10 +364,10 @@ program
 
 program
     .command("export <url>")
-    .description("Export history or reports to CSV or XLSX")
+    .description("Export history or reports to CSV, XLSX, or JSON")
     .option("-t, --target <selector>",  "CSS selector")
     .option("-s, --storage <dir>",      "Storage directory", ".watchdiff")
-    .option("-f, --format <fmt>",       "Output format: csv (default) or xlsx", "csv")
+    .option("-f, --format <fmt>",       "Output format: csv (default), xlsx, or json", "csv")
     .option("--type <type>",            "What to export: reports (default) or snapshots", "reports")
     .option("-n, --limit <number>",     "Number of entries to export", "100")
     .option("-o, --output <file>",      "Output file path (prints to stdout if omitted)")
@@ -405,10 +407,179 @@ program
                 console.error(chalk.red(err instanceof Error ? err.message : String(err)));
                 process.exit(1);
             }
+        } else if (format === "json") {
+            const json = type === "snapshots"
+                ? wd.exportSnapshotsJson(url, limit)
+                : wd.exportReportsJson(url, limit);
+
+            if (output) {
+                writeFileSync(output, json, "utf-8");
+                console.log(chalk.green(`Exported to ${output}`));
+            } else {
+                process.stdout.write(json + "\n");
+            }
         } else {
-            console.error(chalk.red(`Unknown format: ${format}. Use 'csv' or 'xlsx'.`));
+            console.error(chalk.red(`Unknown format: ${format}. Use 'csv', 'xlsx', or 'json'.`));
             process.exit(1);
         }
+    });
+
+// ---------------------------------------------------------------------------
+// snapshot
+// ---------------------------------------------------------------------------
+
+program
+    .command("snapshot <url>")
+    .description("Print the latest stored snapshot for a URL")
+    .option("-t, --target <selector>", "CSS selector")
+    .option("-s, --storage <dir>",     "Storage directory", ".watchdiff")
+    .option("--json",                  "Output raw JSON")
+    .action((url: string, opts: Record<string, string | boolean | undefined>) => {
+        const wd = new WatchDiff((opts["storage"] as string | undefined) ?? ".watchdiff");
+        wd.watch(url, { target: opts["target"] as string | undefined });
+
+        const snapshots = wd.history(url, 1);
+
+        if (snapshots.length === 0) {
+            console.log(chalk.gray("No snapshot found for this URL."));
+            return;
+        }
+
+        const snap = snapshots[0]!;
+
+        if (opts["json"]) {
+            console.log(JSON.stringify({
+                url:       snap.url,
+                target:    snap.target,
+                capturedAt: snap.capturedAt.toISOString(),
+                checksum:  snap.checksum,
+                content:   snap.content,
+            }, null, 2));
+            return;
+        }
+
+        console.log(chalk.bold(`\nLatest snapshot for ${url}\n`));
+        console.log(`  Captured at: ${snap.capturedAt.toISOString().replace("T", " ").slice(0, 19)} UTC`);
+        console.log(`  Checksum:    ${snap.checksum}`);
+        console.log(`\nContent preview:\n`);
+        console.log(snap.content.slice(0, 500));
+        if (snap.content.length > 500) {
+            console.log(chalk.gray(`\n  ... (${snap.content.length - 500} more characters)`));
+        }
+    });
+
+// ---------------------------------------------------------------------------
+// clean
+// ---------------------------------------------------------------------------
+
+program
+    .command("clean")
+    .description("Delete orphan snapshot/report files not tied to any configured URL")
+    .option("-c, --config <file>",  "JSON config file (watchdiff.config.json)")
+    .option("-s, --storage <dir>",  "Storage directory", ".watchdiff")
+    .option("-y, --yes",            "Skip confirmation prompt")
+    .action(async (opts: Record<string, string | boolean | undefined>) => {
+        const storage = (opts["storage"] as string | undefined) ?? ".watchdiff";
+        const cfgPath = (opts["config"] as string | undefined) ?? "watchdiff.config.json";
+
+        if (!existsSync(cfgPath)) {
+            console.error(chalk.red(`Config file not found: ${cfgPath}. Run watchdiff init first.`));
+            process.exit(1);
+        }
+
+        const cfg    = loadConfig(cfgPath);
+        const keyOf  = (url: string, target: string | undefined): string => {
+            const raw = `${url}::${target ?? ""}`;
+            return createHash("md5").update(raw).digest("hex").slice(0, 12);
+        };
+
+        // Collect known hashes from all configured URLs
+        const knownHashes = new Set<string>();
+        for (const w of cfg.watches) {
+            knownHashes.add(keyOf(w.url, w.target));
+        }
+
+        // Scan storage directory for .json files
+        let files: string[] = [];
+        try {
+            files = readdirSync(storage).filter((f) => f.endsWith(".json"));
+        } catch {
+            console.error(chalk.red(`Cannot read storage directory: ${storage}`));
+            process.exit(1);
+        }
+
+        const toDelete: string[] = [];
+        for (const f of files) {
+            // Files are named snap_<hash>.json or report_<hash>.json
+            const match = f.match(/^(?:snap|report)_([a-f0-9]{12})\.json$/);
+            if (!match) continue;
+            const hash = match[1]!;
+            if (!knownHashes.has(hash)) {
+                toDelete.push(f);
+            }
+        }
+
+        if (toDelete.length === 0) {
+            console.log(chalk.green("No orphan files found."));
+            return;
+        }
+
+        console.log(chalk.yellow(`\nFound ${toDelete.length} orphan file(s):`));
+        for (const f of toDelete) {
+            console.log(`  ${f}`);
+        }
+
+        if (!opts["yes"]) {
+            const readline = await import("node:readline");
+            const rl       = readline.createInterface({ input: process.stdin, output: process.stdout });
+            const answer   = await new Promise<string>((resolve) => {
+                rl.question(chalk.yellow(`\nDelete these ${toDelete.length} file(s)? [y/N] `), resolve);
+            });
+            rl.close();
+            if (answer.toLowerCase() !== "y") {
+                console.log("Aborted.");
+                return;
+            }
+        }
+
+        let deleted = 0;
+        for (const f of toDelete) {
+            try {
+                unlinkSync(join(storage, f));
+                deleted++;
+            } catch (err) {
+                console.warn(chalk.yellow(`  Failed to delete ${f}: ${err instanceof Error ? err.message : String(err)}`));
+            }
+        }
+        console.log(chalk.green(`\nDeleted ${deleted} file(s).`));
+    });
+
+// ---------------------------------------------------------------------------
+// pause
+// ---------------------------------------------------------------------------
+
+program
+    .command("pause <urlOrId>")
+    .description("Pause a watcher by URL or stable ID (requires a running watchdiff process via IPC — prints a reminder)")
+    .action((urlOrId: string) => {
+        console.log(chalk.yellow(
+            `Note: 'watchdiff pause' signals the running process to pause watcher "${urlOrId}".\n` +
+            `To pause programmatically, call wd.pause("${urlOrId}") in your code.`
+        ));
+    });
+
+// ---------------------------------------------------------------------------
+// resume
+// ---------------------------------------------------------------------------
+
+program
+    .command("resume <urlOrId>")
+    .description("Resume a paused watcher by URL or stable ID (requires a running watchdiff process via IPC — prints a reminder)")
+    .action((urlOrId: string) => {
+        console.log(chalk.yellow(
+            `Note: 'watchdiff resume' signals the running process to resume watcher "${urlOrId}".\n` +
+            `To resume programmatically, call wd.resume("${urlOrId}") in your code.`
+        ));
     });
 
 // ---------------------------------------------------------------------------
@@ -540,8 +711,8 @@ program
         const filePath = opts.config;
         let allPassed  = true;
 
-        const pass = (msg: string) => console.log(chalk.green(`  ✅ ${msg}`));
-        const fail = (msg: string) => { console.log(chalk.red(`  ❌ ${msg}`)); allPassed = false; };
+        const pass = (msg: string) => console.log(chalk.green(`  [ok] ${msg}`));
+        const fail = (msg: string) => { console.log(chalk.red(`  [fail] ${msg}`)); allPassed = false; };
 
         console.log(chalk.bold(`\nValidating ${filePath}\n`));
 

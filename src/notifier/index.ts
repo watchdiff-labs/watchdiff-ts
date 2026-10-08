@@ -25,7 +25,7 @@ const DEFAULT_WEBHOOK_RETRIES = 3;
 const RETRY_BASE_DELAY_MS     = 500;
 
 export class Notifier {
-    async notify(report: DiffReport, alert: AlertConfig): Promise<void> {
+    async notify(report: DiffReport, alert: AlertConfig, webhookHeaders?: Record<string, string>): Promise<void> {
         if (!reportHasChanges(report)) return;
         if (report.changes.length < alert.minChanges) return;
 
@@ -41,7 +41,7 @@ export class Notifier {
         // 2. Webhooks (with retry)
         const maxAttempts = (alert.webhookRetries ?? DEFAULT_WEBHOOK_RETRIES) + 1;
         await Promise.allSettled(
-            alert.webhooks.map((url) => this.sendWebhookWithRetry(url, report, maxAttempts))
+            alert.webhooks.map((url) => this.sendWebhookWithRetry(url, report, maxAttempts, webhookHeaders))
         );
 
         // 3. Email
@@ -55,14 +55,15 @@ export class Notifier {
     }
 
     private async sendWebhookWithRetry(
-        url:         string,
-        report:      DiffReport,
-        maxAttempts: number
+        url:            string,
+        report:         DiffReport,
+        maxAttempts:    number,
+        webhookHeaders?: Record<string, string>
     ): Promise<void> {
         let lastErr: unknown;
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
-                await this.sendWebhook(url, report);
+                await this.sendWebhook(url, report, webhookHeaders);
                 return;
             } catch (err) {
                 lastErr = err;
@@ -77,11 +78,11 @@ export class Notifier {
         );
     }
 
-    private async sendWebhook(url: string, report: DiffReport): Promise<void> {
+    private async sendWebhook(url: string, report: DiffReport, webhookHeaders?: Record<string, string>): Promise<void> {
         const { payload, headers } = this.buildPayload(url, report);
         const res = await globalThis.fetch(url, {
             method:  "POST",
-            headers: { "Content-Type": "application/json", ...headers },
+            headers: { "Content-Type": "application/json", ...headers, ...(webhookHeaders ?? {}) },
             body:    JSON.stringify(payload),
             signal:  AbortSignal.timeout(10_000),
         });
@@ -106,9 +107,35 @@ export class Notifier {
             return { payload: { content: text.slice(0, 2000) }, headers: {} };
         }
 
-        // Slack
+        // Slack - Block Kit payload for richer formatting
         if (url.includes("hooks.slack.com")) {
-            return { payload: { text: text.slice(0, 3000) }, headers: {} };
+            const added    = report.changes.filter((c) => c.kind === "added").length;
+            const removed  = report.changes.filter((c) => c.kind === "removed").length;
+            const modified = report.changes.filter((c) => c.kind === "modified").length;
+            const sectionParts: string[] = [];
+            if (added)    sectionParts.push(`• ${added} added`);
+            if (removed)  sectionParts.push(`• ${removed} removed`);
+            if (modified) sectionParts.push(`• ${modified} modified`);
+            const ts = report.comparedAt.toISOString().replace("T", " ").slice(0, 19);
+            return {
+                payload: {
+                    blocks: [
+                        {
+                            type: "header",
+                            text: { type: "plain_text", text: `[${report.label}] Change detected` },
+                        },
+                        {
+                            type: "section",
+                            text: { type: "mrkdwn", text: sectionParts.join("  ") || "No changes" },
+                        },
+                        {
+                            type: "context",
+                            elements: [{ type: "mrkdwn", text: `${report.url} · ${ts} UTC` }],
+                        },
+                    ],
+                },
+                headers: {},
+            };
         }
 
         // Telegram  - URL format: https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>

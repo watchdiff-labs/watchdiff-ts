@@ -407,7 +407,7 @@ export class Scheduler {
                 before:     { url: config.url, target: config.target, content: "", rawHtml: "", capturedAt: new Date(now), checksum: "" },
                 after:      { url: config.url, target: config.target, content: "", rawHtml: "", capturedAt: new Date(now), checksum: "" },
             };
-            await this.notifier.notify(fakeReport, config.alert);
+            await this.notifier.notify(fakeReport, config.alert, config.webhookHeaders);
         }
     }
 
@@ -590,6 +590,11 @@ export class Scheduler {
                 state.consecutiveSuccessCount  = 0;
                 state.alertsSuppressedByPolicy = false;
                 console.info(`[${config.label}] Recovered after failures - alerts re-enabled.`);
+                if (config.onRecovery) {
+                    try { config.onRecovery(config); } catch (err) {
+                        console.warn("[watchdiff] onRecovery callback error:", err);
+                    }
+                }
             } else {
                 console.debug(
                     `[${config.label}] Recovery check ${state.consecutiveSuccessCount}/${requiredSuccesses} - alerts still suppressed.`
@@ -607,8 +612,30 @@ export class Scheduler {
                 if (config.maxSnapshots) {
                     this.store.pruneSnapshots?.(config.url, config.target, config.maxSnapshots);
                 }
+                if (config.retentionDays) {
+                    this.pruneByRetention(config);
+                }
             }
             console.info(`[${config.label}] First snapshot captured.`);
+
+            // alertOnFirstCheck: synthesise a DiffReport with all content as "added"
+            if (config.alertOnFirstCheck && !config.dryRun) {
+                const { makeSnapshot: mk } = await import("../models.js");
+                const emptyBefore = mk(config.url, config.target, "", "");
+                const firstReport = this.engine.compare(emptyBefore, snapshot, config);
+                if (firstReport.changes.length > 0) {
+                    for (const cb of this.globalCallbacks) {
+                        try { await cb(firstReport); } catch (err) {
+                            console.warn("[watchdiff] Global callback error:", err);
+                        }
+                    }
+                    if (config.alert) {
+                        await this.notifier.notify(firstReport, config.alert, config.webhookHeaders);
+                    }
+                }
+                return firstReport;
+            }
+
             return null;
         }
 
@@ -621,6 +648,9 @@ export class Scheduler {
             this.store.saveSnapshot(snapshot);
             if (config.maxSnapshots) {
                 this.store.pruneSnapshots?.(config.url, config.target, config.maxSnapshots);
+            }
+            if (config.retentionDays) {
+                this.pruneByRetention(config);
             }
         }
 
@@ -774,7 +804,7 @@ export class Scheduler {
                 }
 
                 if (config.alert) {
-                    await this.notifier.notify(report, config.alert);
+                    await this.notifier.notify(report, config.alert, config.webhookHeaders);
                 }
             }
         } else {
@@ -973,8 +1003,31 @@ export class Scheduler {
             }
 
             if (config.alert) {
-                await this.notifier.notify(report, config.alert);
+                await this.notifier.notify(report, config.alert, config.webhookHeaders);
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Retention pruning
+    // ---------------------------------------------------------------------------
+
+    private pruneByRetention(config: WatchConfig): void {
+        if (!config.retentionDays) return;
+        const cutoff = Date.now() - config.retentionDays * 86_400_000;
+        try {
+            const history = this.store.loadHistory(config.url, config.target);
+            const retained = history.filter((s) => s.capturedAt.getTime() >= cutoff);
+            if (retained.length < history.length) {
+                // Re-save only retained snapshots by clearing and re-saving
+                this.store.clearHistory(config.url, config.target);
+                for (const snap of retained) {
+                    this.store.saveSnapshot(snap);
+                }
+                console.debug(`[${config.label}] Retention pruning: removed ${history.length - retained.length} old snapshot(s).`);
+            }
+        } catch (err) {
+            console.warn(`[${config.label}] Retention pruning error:`, err instanceof Error ? err.message : String(err));
         }
     }
 }

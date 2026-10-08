@@ -12,7 +12,7 @@ import type { IStore, Snapshot } from "../models.js";
 // Types
 // ---------------------------------------------------------------------------
 
-export type ExportFormat = "csv" | "xlsx";
+export type ExportFormat = "csv" | "xlsx" | "json";
 export type ExportType   = "reports" | "snapshots";
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,33 @@ export class Exporter {
         }
 
         return lines.join("\n");
+    }
+
+    // ------------------------------------------------------------------
+    // JSON
+    // ------------------------------------------------------------------
+
+    /**
+     * Export diff reports to a formatted JSON string.
+     */
+    exportReportsJson(url: string, target?: string, limit = 100): string {
+        const rows = this.store.loadReports(url, target, limit);
+        return JSON.stringify(rows, null, 2);
+    }
+
+    /**
+     * Export snapshot history to a formatted JSON string.
+     */
+    exportSnapshotsJson(url: string, target?: string, limit = 100): string {
+        const snaps = this.store.loadHistory(url, target, limit);
+        const data = snaps.map((s) => ({
+            url:            s.url,
+            target:         s.target,
+            capturedAt:     s.capturedAt.toISOString(),
+            checksum:       s.checksum,
+            content:        s.content,
+        }));
+        return JSON.stringify(data, null, 2);
     }
 
     // ------------------------------------------------------------------

@@ -157,6 +157,16 @@ export interface WatchOptions {
     activeBetween?: ActiveBetween;
     /** Policy controlling consecutive failures/recoveries before alerting. */
     failurePolicy?: FailurePolicy;
+    /** Called when a watcher recovers after a consecutive-failure streak. */
+    onRecovery?: (config: WatchConfig) => void;
+    /** Cap on exponential backoff delay in ms (default: Infinity). */
+    maxRetryDelay?: number;
+    /** Fire onChange on the very first snapshot capture (default false). */
+    alertOnFirstCheck?: boolean;
+    /** Extra headers merged into every outgoing webhook POST. */
+    webhookHeaders?: Record<string, string>;
+    /** Auto-delete snapshots older than N days after each save. */
+    retentionDays?: number;
 }
 
 export interface WatchFileOptions {
@@ -365,6 +375,11 @@ export class WatchDiff {
                 maintenanceWindows:   opts.maintenanceWindows,
                 activeBetween:        opts.activeBetween,
                 failurePolicy:        opts.failurePolicy,
+                onRecovery:           opts.onRecovery,
+                maxRetryDelay:        opts.maxRetryDelay,
+                alertOnFirstCheck:    opts.alertOnFirstCheck,
+                webhookHeaders:       opts.webhookHeaders,
+                retentionDays:        opts.retentionDays,
                 alert,
             })
         );
@@ -652,6 +667,24 @@ export class WatchDiff {
         const config   = this.findConfig(url);
         const exporter = new Exporter(this.store);
         return exporter.snapshotsToCsv(config.url, config.target, limit);
+    }
+
+    /**
+     * Export diff reports for a URL as a JSON string.
+     */
+    exportReportsJson(url: string, limit = 100): string {
+        const config   = this.findConfig(url);
+        const exporter = new Exporter(this.store);
+        return exporter.exportReportsJson(config.url, config.target, limit);
+    }
+
+    /**
+     * Export snapshot history for a URL as a JSON string.
+     */
+    exportSnapshotsJson(url: string, limit = 100): string {
+        const config   = this.findConfig(url);
+        const exporter = new Exporter(this.store);
+        return exporter.exportSnapshotsJson(config.url, config.target, limit);
     }
 
     /**

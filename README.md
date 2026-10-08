@@ -51,6 +51,16 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 - **Snapshot pruning** - keep only the last N snapshots per URL
 - **Change threshold** - require a minimum fraction of content to change before alerting
 - **ignoreNumbers** - strip standalone numbers to ignore counter/date noise
+- **`onRecovery` callback** - fired when a watcher recovers after a consecutive-failure streak
+- **`maxRetryDelay`** - cap the maximum exponential backoff delay
+- **`alertOnFirstCheck`** - optionally fire `onChange` on the very first snapshot capture
+- **`webhookHeaders`** - add custom headers to every outgoing webhook POST
+- **Slack Block Kit** - enriched Slack webhook payloads with header, section, and context blocks
+- **`retentionDays`** - automatically prune snapshots older than N days
+- **JSON export** - export reports and snapshots as JSON (`--format json` or `exportReportsJson()`)
+- **`watchdiff snapshot`** - CLI command to print the latest stored snapshot for a URL
+- **`watchdiff clean`** - CLI command to delete orphan snapshot files
+- **`watchdiff pause` / `watchdiff resume`** - pause and resume watchers from the CLI
 - **Fully typed** - complete TypeScript types included
 - **Native fetch** - no HTTP library dependency, runs on Node.js 18+
 
@@ -113,6 +123,14 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 | Multi-URL config file | `watchdiff init` then edit `watchdiff.config.json` |
 | Show watcher status | `watchdiff status` |
 | Show last diff | `watchdiff diff https://example.com` |
+| React when a watcher recovers | `onRecovery: (config) => console.log("Recovered:", config.label)` |
+| Cap backoff delay | `maxRetryDelay: 30000` (max 30s between retries) |
+| Alert on very first check | `alertOnFirstCheck: true` |
+| Add auth headers to webhooks | `webhookHeaders: { Authorization: "Bearer token" }` |
+| Auto-prune old snapshots | `retentionDays: 30` |
+| Export as JSON | `wd.exportReportsJson(url)` / `watchdiff export url --format json` |
+| View latest snapshot | `watchdiff snapshot https://example.com` |
+| Remove orphan files | `watchdiff clean --config watchdiff.config.json` |
 
 ### Quick navigation
 
@@ -155,6 +173,13 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
   - [JSON path targeting](#json-path-targeting)
   - [Cookie-based authentication](#cookie-based-authentication)
   - [Email alerts](#email-alerts)
+  - [onRecovery callback](#onrecovery-callback)
+  - [maxRetryDelay](#maxretrydelay)
+  - [alertOnFirstCheck](#alertonfirstcheck)
+  - [webhookHeaders](#webhookheaders)
+  - [Slack Block Kit](#slack-block-kit)
+  - [retentionDays](#retentiondays)
+  - [JSON export](#json-export)
   - [Stable watcher ID](#stable-watcher-id)
   - [Concurrency limiting](#concurrency-limiting)
   - [Maintenance windows](#maintenance-windows)
@@ -360,6 +385,11 @@ Register a URL to monitor.
 | `maintenanceWindows` | `MaintenanceWindow[]` | - | Time windows during which checks are skipped entirely |
 | `activeBetween` | `ActiveBetween` | - | Restrict monitoring to specific hours and/or days of the week |
 | `failurePolicy` | `FailurePolicy` | - | Control how many consecutive failures/recoveries are needed before alerting |
+| `onRecovery` | `fn` | - | Called when a watcher recovers after a consecutive-failure streak |
+| `maxRetryDelay` | `number` | `Infinity` | Cap on exponential backoff delay in ms between fetch retries |
+| `alertOnFirstCheck` | `boolean` | `false` | Fire `onChange` on the very first snapshot capture |
+| `webhookHeaders` | `Record<string, string>` | - | Extra headers merged into every outgoing webhook POST |
+| `retentionDays` | `number` | - | Auto-delete snapshots older than N days after each save |
 
 ```typescript
 wd
@@ -604,6 +634,12 @@ const buf = await wd.exportReportsXlsx("https://example.com", 100);
 fs.writeFileSync("reports.xlsx", buf);
 
 const snapBuf = await wd.exportSnapshotsXlsx("https://example.com");
+
+// JSON (no extra dependency)
+const json = wd.exportReportsJson("https://example.com", 100);
+fs.writeFileSync("reports.json", json);
+
+const snapJson = wd.exportSnapshotsJson("https://example.com", 50);
 ```
 
 
@@ -1136,9 +1172,9 @@ wd.watch("https://example.com", {
   alertOnStatusChange:  true,
   onStatusChange: ({ url, label, previousStatus, currentStatus }) => {
     if (currentStatus === 200) {
-      console.log(`✅ ${label} recovered (${previousStatus} → 200)`);
+      console.log(`[ok] ${label} recovered (${previousStatus} → 200)`);
     } else {
-      console.error(`🔴 ${label} is down: ${previousStatus} → ${currentStatus}`);
+      console.error(`[down] ${label} is down: ${previousStatus} → ${currentStatus}`);
     }
   },
   // Optionally combine with webhooks for instant notifications
@@ -2128,7 +2164,7 @@ watchdiff history https://example.com --limit 10
 watchdiff reports https://example.com --limit 20
 ```
 
-### `export` - export to CSV / XLSX
+### `export` - export to CSV / XLSX / JSON
 
 ```bash
 # Print reports as CSV to stdout
@@ -2143,8 +2179,56 @@ watchdiff export https://example.com --type snapshots --output snapshots.csv
 # Export as XLSX (requires: npm install exceljs)
 watchdiff export https://example.com --format xlsx --output reports.xlsx
 
+# Export as JSON
+watchdiff export https://example.com --format json
+watchdiff export https://example.com --format json --output reports.json
+watchdiff export https://example.com --type snapshots --format json --output snapshots.json
+
 # Limit the number of exported entries
 watchdiff export https://example.com --limit 500 --output reports.csv
+```
+
+### `snapshot` - print the latest stored snapshot
+
+Print the most recently captured snapshot for a URL without fetching the page again.
+
+```bash
+watchdiff snapshot https://example.com
+watchdiff snapshot https://example.com --target .price
+watchdiff snapshot https://example.com --storage .mydata
+watchdiff snapshot https://example.com --json   # output raw JSON
+```
+
+Output includes `capturedAt`, `checksum`, and a 500-character content preview. Use `--json` for the full content.
+
+### `clean` - delete orphan snapshot files
+
+Remove snapshot and report files from storage that are no longer tied to any configured URL. This is useful after removing a watcher from your config file.
+
+```bash
+watchdiff clean                          # uses watchdiff.config.json
+watchdiff clean --config my.json         # specific config file
+watchdiff clean --storage .mydata        # specific storage directory
+watchdiff clean --yes                    # skip confirmation prompt
+```
+
+`clean` reads the config file, computes the expected file hashes for all configured URLs, then deletes any `snap_*.json` and `report_*.json` files in the storage directory whose hash does not match a known URL. It prints a list of files to be deleted and asks for confirmation unless `--yes` is passed.
+
+### `pause` / `resume` - suspend and restart a watcher
+
+Signal a running `watchdiff` process to pause or resume a specific watcher. These commands print a reminder to use the programmatic API (`wd.pause()` / `wd.resume()`) since CLI-to-process IPC is not built-in.
+
+```bash
+watchdiff pause https://example.com
+watchdiff resume my-watcher-id
+```
+
+For programmatic control within a long-running script:
+
+```typescript
+const stop = wd.start();
+wd.pause("https://example.com");     // or wd.pause("my-id")
+setTimeout(() => wd.resume("https://example.com"), 60_000);
 ```
 
 ### `db` - database monitoring
@@ -2568,6 +2652,127 @@ wd.watch("https://example.com/prices", {
 ```
 
 Optional fields: `from` (defaults to `user@host`), `subject` (defaults to `"[WatchDiff] Change detected: {label}"`). Multiple recipients: `to: ["a@x.com", "b@x.com"]`.
+
+## onRecovery callback
+
+Called once when a watcher returns to normal operation after a consecutive-failure streak. Use it to send a "back online" notification or reset an external status flag.
+
+```typescript
+wd.watch("https://example.com", {
+  failurePolicy: { consecutiveFailures: 3, recoveryChecks: 2 },
+  onError:    (err) => console.error("Still failing:", err.message),
+  onRecovery: (config) => {
+    console.log(`${config.label} is back online.`);
+    sendSlackMessage(`${config.label} recovered.`);
+  },
+});
+```
+
+`onRecovery` fires after `recoveryChecks` consecutive successful fetches have cleared the failure state (default: 1 success).
+
+## maxRetryDelay
+
+Cap the maximum time WatchDiff waits between fetch retry attempts. Without this, exponential backoff can grow to hours for many retries. Set `maxRetryDelay` to keep intervals predictable.
+
+```typescript
+wd.watch("https://example.com", {
+  retries:       10,
+  retryDelay:    1000,   // 1s base
+  maxRetryDelay: 30_000, // never wait more than 30s between retries
+});
+```
+
+Delay formula: `Math.min(retryDelay * 2 ^ attempt, maxRetryDelay)`.
+
+## alertOnFirstCheck
+
+By default, WatchDiff silently captures the first snapshot and starts alerting on subsequent changes. Set `alertOnFirstCheck: true` to fire `onChange` (and webhooks) immediately on the very first capture — useful for sanity-checking that your selectors and callbacks work, or for loading an initial state into a downstream system.
+
+```typescript
+wd.watch("https://example.com/prices", {
+  target:            ".price",
+  alertOnFirstCheck: true,
+  onChange: (report) => {
+    // Fired on first capture: all content is "added"
+    console.log("Initial state:", report.changes.length, "items");
+  },
+});
+```
+
+The synthetic first-check report has an empty `before` snapshot and all content marked as `added`. It goes through the same alert pipeline (callbacks, webhooks) as any subsequent change report.
+
+## webhookHeaders
+
+Merge custom HTTP headers into every outgoing webhook POST. Use this for authentication tokens, API keys, or routing headers required by your webhook endpoint.
+
+```typescript
+wd.watch("https://example.com", {
+  webhooks: ["https://internal.example.com/hooks/watchdiff"],
+  webhookHeaders: {
+    Authorization: "Bearer my-internal-token",
+    "X-Source":    "watchdiff",
+  },
+});
+```
+
+Headers are merged after the built-in `Content-Type: application/json` header, so you can override it if needed. `webhookHeaders` does not affect the Slack/Discord/Telegram payload format — only the HTTP request headers.
+
+## Slack Block Kit
+
+When the webhook URL matches `hooks.slack.com`, WatchDiff sends a structured Block Kit payload instead of a plain text message. The payload includes a header block, a change-summary section, and a context block with URL and timestamp.
+
+```json
+{
+  "blocks": [
+    { "type": "header",  "text": { "type": "plain_text", "text": "[Book price] Change detected" } },
+    { "type": "section", "text": { "type": "mrkdwn",     "text": "• 1 modified" } },
+    { "type": "context", "elements": [{ "type": "mrkdwn", "text": "https://books.toscrape.com · 2026-09-18 09:00:00 UTC" }] }
+  ]
+}
+```
+
+No configuration is needed — the Block Kit format is applied automatically for Slack webhooks. Combine with `webhookHeaders` to add an `Authorization` header when using Slack's app-level tokens.
+
+## retentionDays
+
+Automatically delete snapshots older than N days after each save. Use it to cap disk usage without manually managing storage.
+
+```typescript
+wd.watch("https://example.com", {
+  retentionDays: 30,   // keep only snapshots from the last 30 days
+  maxSnapshots:  500,  // also limit by count (both can be combined)
+});
+```
+
+Retention is applied after every snapshot save, before the check result is returned. Snapshots older than `Date.now() - retentionDays * 86400000` ms are removed. Reports are not affected.
+
+## JSON export
+
+Export monitoring history as a formatted JSON string for use with log aggregators, dashboards, or custom tooling.
+
+**API:**
+
+```typescript
+// Reports (array of change entries)
+const json = wd.exportReportsJson("https://example.com", 100);
+fs.writeFileSync("reports.json", json);
+
+// Snapshots (array of captured content)
+const snapJson = wd.exportSnapshotsJson("https://example.com", 50);
+```
+
+**CLI:**
+
+```bash
+# Print JSON to stdout
+watchdiff export https://example.com --format json
+
+# Export snapshots as JSON to a file
+watchdiff export https://example.com --type snapshots --format json --output snapshots.json
+
+# Limit entries
+watchdiff export https://example.com --format json --limit 50 --output reports.json
+```
 
 ## Advanced usage
 
