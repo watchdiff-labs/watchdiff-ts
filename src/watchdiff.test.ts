@@ -268,7 +268,7 @@ describe("Notifier", () => {
         };
         await notifier.notify(report, alert);
         const body = JSON.parse(fetchSpy.mock.calls[0]![1]!.body as string) as Record<string, unknown>;
-        expect(body).toHaveProperty("text");
+        expect(body).toHaveProperty("blocks");
     });
 
     it("sends Telegram webhook with chat_id field", async () => {
