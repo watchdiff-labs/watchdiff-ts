@@ -69,9 +69,28 @@ export class Fetcher {
         const userAgent  = pickRandom(config.userAgents ?? []) ?? pickRandom([...DEFAULT_USER_AGENTS]) ?? FALLBACK_UA;
         const reqHeaders: Record<string, string> = { ...BASE_HEADERS, "User-Agent": userAgent, ...config.headers };
         if (config.cookies && Object.keys(config.cookies).length > 0) {
-            const existing = reqHeaders["Cookie"] ? reqHeaders["Cookie"] + "; " : "";
-            reqHeaders["Cookie"] = existing + Object.entries(config.cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+            const existing          = reqHeaders["Cookie"] ? reqHeaders["Cookie"] + "; " : "";
+            reqHeaders["Cookie"]    = existing + Object.entries(config.cookies).map(([k, v]) => `${k}=${v}`).join("; ");
         }
+        // HTTP Basic Auth
+        if (config.auth) {
+            const encoded                  = Buffer.from(`${config.auth.user}:${config.auth.pass}`).toString("base64");
+            reqHeaders["Authorization"]    = `Basic ${encoded}`;
+        }
+
+        // POST body handling
+        let method  = "GET";
+        let reqBody: string | undefined;
+        if (config.requestBody !== undefined) {
+            method = "POST";
+            if (typeof config.requestBody === "string") {
+                reqBody = config.requestBody;
+            } else {
+                reqBody                       = JSON.stringify(config.requestBody);
+                reqHeaders["Content-Type"]    = "application/json";
+            }
+        }
+
         const controller = new AbortController();
         const timer      = setTimeout(() => controller.abort(), config.timeout);
 
@@ -79,9 +98,11 @@ export class Fetcher {
             const proxy = pickRandom(config.proxies ?? []);
 
             const response = proxy
-                ? await this.fetchWithProxy(config.url, reqHeaders, controller.signal, proxy)
+                ? await this.fetchWithProxy(config.url, reqHeaders, controller.signal, proxy, method, reqBody)
                 : await globalThis.fetch(config.url, {
+                    method,
                     headers:  reqHeaders,
+                    body:     reqBody,
                     signal:   controller.signal,
                     redirect: "follow",
                 });
@@ -121,7 +142,9 @@ export class Fetcher {
         url: string,
         headers: Record<string, string>,
         signal: AbortSignal,
-        proxy: string
+        proxy: string,
+        method = "GET",
+        body?: string
     ): Promise<Response> {
         try {
             // any: undici types differ slightly from globalThis.fetch types - both are valid
@@ -131,12 +154,12 @@ export class Fetcher {
             };
             const undici        = await import("undici") as unknown as UndiciModule;
             const dispatcher    = new undici.ProxyAgent(proxy);
-            return undici.fetch(url, { headers, signal, redirect: "follow", dispatcher });
+            return undici.fetch(url, { method, headers, body, signal, redirect: "follow", dispatcher });
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             if (msg.includes("undici") || msg.includes("Cannot find")) {
                 console.warn("[watchdiff] undici unavailable - proxy ignored. Run: npm install undici");
-                return globalThis.fetch(url, { headers, signal, redirect: "follow" });
+                return globalThis.fetch(url, { method, headers, body, signal, redirect: "follow" });
             }
             throw err;
         }

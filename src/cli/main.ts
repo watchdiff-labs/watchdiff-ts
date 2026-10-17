@@ -225,6 +225,61 @@ program
     });
 
 // ---------------------------------------------------------------------------
+// list
+// ---------------------------------------------------------------------------
+
+program
+    .command("list")
+    .description("List all configured watchers and their state (no monitoring is started)")
+    .option("-c, --config <file>",  "JSON config file (watchdiff.config.json)")
+    .option("-s, --storage <dir>",  "Storage directory", ".watchdiff")
+    .option("--json",               "Output raw JSON array")
+    .action((opts: Record<string, string | boolean | undefined>) => {
+        const cfgPath = (opts["config"] as string | undefined) ?? "watchdiff.config.json";
+
+        if (!existsSync(cfgPath)) {
+            console.error(chalk.red(`Config file not found: ${cfgPath}. Run watchdiff init first.`));
+            process.exit(1);
+        }
+
+        const cfg = loadConfig(cfgPath);
+        const wd  = new WatchDiff((opts["storage"] as string | undefined) ?? cfg.storage ?? ".watchdiff");
+        applyConfig(wd, cfg);
+
+        // Get statuses without calling .start()
+        const statuses = wd.status();
+
+        if (opts["json"]) {
+            // Include tags from config in JSON output
+            const out = statuses.map((s, i) => {
+                const wCfg = cfg.watches[i];
+                return { ...s, tags: (wCfg as Record<string, unknown>)["tags"] ?? [] };
+            });
+            console.log(JSON.stringify(out, null, 2));
+            return;
+        }
+
+        console.log(chalk.bold("\nConfigured watchers\n"));
+        for (let i = 0; i < statuses.length; i++) {
+            const s    = statuses[i]!;
+            const wCfg = cfg.watches[i] as Record<string, unknown>;
+            const tags = Array.isArray(wCfg["tags"]) ? (wCfg["tags"] as string[]) : [];
+            const paused = s.paused ? chalk.yellow(" [PAUSED]") : "";
+            console.log(`  ${chalk.cyan(s.label)}${paused}`);
+            console.log(`    URL:      ${s.url}`);
+            if (s.target) console.log(`    Target:   ${s.target}`);
+            if (s.interval && !(wCfg["schedule"])) console.log(`    Interval: ${s.interval}s`);
+            if (wCfg["schedule"]) console.log(`    Schedule: ${String(wCfg["schedule"])}`);
+            if (tags.length > 0) console.log(`    Tags:     ${tags.join(", ")}`);
+            console.log(`    Paused:   ${s.paused}`);
+            console.log();
+        }
+        if (statuses.length === 0) {
+            console.log(chalk.gray("  No watchers configured."));
+        }
+    });
+
+// ---------------------------------------------------------------------------
 // diff
 // ---------------------------------------------------------------------------
 

@@ -164,12 +164,15 @@ export class Scheduler {
     /** URLs where AI was permanently disabled (invalid key / bad model). */
     private readonly aiDisabled                                 = new Set<string>();
     private readonly semaphore:   Semaphore | null;
+    /** Global floor on minimum seconds between checks (can be overridden per-watcher). */
+    private readonly globalMinInterval: number;
     private configs: WatchConfig[]                              = [];
 
-    constructor(private readonly store: IStore, concurrency?: number) {
+    constructor(private readonly store: IStore, concurrency?: number, globalMinInterval = 0) {
         this.semaphore = concurrency !== undefined && concurrency > 0
             ? new Semaphore(concurrency)
             : null;
+        this.globalMinInterval = globalMinInterval;
     }
 
     addGlobalCallback(cb: GlobalCallback): void {
@@ -237,6 +240,15 @@ export class Scheduler {
     private async runCheck(config: WatchConfig): Promise<DiffReport | null> {
         const state = this.getState(config);
 
+        // onBeforeCheck hook
+        if (config.onBeforeCheck) {
+            try {
+                await config.onBeforeCheck(config);
+            } catch (err) {
+                console.warn(`[${config.label}] onBeforeCheck threw - check will still proceed:`, err instanceof Error ? err.message : String(err));
+            }
+        }
+
         // Retry-After: skip if still within delay window
         if (state.retryAfterUntil > Date.now()) {
             const remainingSec = Math.ceil((state.retryAfterUntil - Date.now()) / 1000);
@@ -293,6 +305,18 @@ export class Scheduler {
         if (state) {
             state.paused = true;
             console.info(`[watchdiff] Paused watcher for ${urlOrId}`);
+            return;
+        }
+        // Try matching by tag
+        let tagMatched = false;
+        for (const config of this.configs) {
+            if (config.tags && config.tags.includes(urlOrId)) {
+                const s = this.urlStates.get(this.stateKey(config));
+                if (s) { s.paused = true; tagMatched = true; }
+            }
+        }
+        if (tagMatched) {
+            console.info(`[watchdiff] Paused all watchers with tag "${urlOrId}"`);
         }
     }
 
@@ -301,6 +325,18 @@ export class Scheduler {
         if (state) {
             state.paused = false;
             console.info(`[watchdiff] Resumed watcher for ${urlOrId}`);
+            return;
+        }
+        // Try matching by tag
+        let tagMatched = false;
+        for (const config of this.configs) {
+            if (config.tags && config.tags.includes(urlOrId)) {
+                const s = this.urlStates.get(this.stateKey(config));
+                if (s) { s.paused = false; tagMatched = true; }
+            }
+        }
+        if (tagMatched) {
+            console.info(`[watchdiff] Resumed all watchers with tag "${urlOrId}"`);
         }
     }
 
@@ -411,13 +447,20 @@ export class Scheduler {
         }
     }
 
-    /** Compute interval with optional ±jitter. */
+    /** Compute interval with optional ±jitter, floored by minInterval. */
     private effectiveInterval(config: WatchConfig): number {
         const base   = config.interval;
         const jitter = config.jitter ?? 0;
-        if (jitter <= 0) return base;
-        const variance = base * jitter * (Math.random() * 2 - 1);
-        return Math.max(1, Math.round(base + variance));
+        let result: number;
+        if (jitter <= 0) {
+            result = base;
+        } else {
+            const variance = base * jitter * (Math.random() * 2 - 1);
+            result = Math.max(1, Math.round(base + variance));
+        }
+        // Apply per-watcher minInterval, falling back to global floor
+        const floor = config.minInterval ?? this.globalMinInterval;
+        return Math.max(result, floor);
     }
 
     private async check(config: WatchConfig): Promise<DiffReport | null> {

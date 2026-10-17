@@ -61,6 +61,12 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 - **`watchdiff snapshot`** - CLI command to print the latest stored snapshot for a URL
 - **`watchdiff clean`** - CLI command to delete orphan snapshot files
 - **`watchdiff pause` / `watchdiff resume`** - pause and resume watchers from the CLI
+- **HTTP Basic Auth** - `auth: { user, pass }` for password-protected endpoints — automatically adds an `Authorization: Basic` header
+- **`onBeforeCheck` hook** - async callback fired before every fetch tick, useful to refresh tokens or log activity
+- **POST request support** - `requestBody` switches the fetcher to POST for APIs that require a request body
+- **Watcher tags** - `tags: ["prod", "prices"]` then `wd.pause("prod")` to pause or resume an entire group
+- **`watchdiff list`** - CLI command listing all configured watchers with their label, URL, target, interval, tags, and paused state
+- **`minInterval`** - global (`new WatchDiff({ minInterval: 30 })`) or per-watcher floor on the minimum seconds between checks
 - **Fully typed** - complete TypeScript types included
 - **Native fetch** - no HTTP library dependency, runs on Node.js 18+
 
@@ -131,6 +137,12 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 | Export as JSON | `wd.exportReportsJson(url)` / `watchdiff export url --format json` |
 | View latest snapshot | `watchdiff snapshot https://example.com` |
 | Remove orphan files | `watchdiff clean --config watchdiff.config.json` |
+| HTTP Basic Auth | `auth: { user: "alice", pass: "secret" }` |
+| Async pre-fetch hook | `onBeforeCheck: async (config) => { /* refresh token */ }` |
+| POST to an API | `requestBody: { query: "SELECT 1" }` or `requestBody: "raw body"` |
+| Group watchers by tag | `tags: ["prod"]` then `wd.pause("prod")` |
+| List configured watchers | `watchdiff list` or `watchdiff list --config my.json` |
+| Floor check frequency | `minInterval: 30` (per-watcher) or `new WatchDiff({ minInterval: 30 })` (global) |
 
 ### Quick navigation
 
@@ -192,6 +204,11 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
   - [Config file](#watchdiff-init---config-file)
   - [Environment variables](#environment-variables)
   - [Validate config](#validate-config)
+  - [HTTP Basic Auth](#http-basic-auth)
+  - [onBeforeCheck hook](#onbeforecheck-hook)
+  - [POST request support](#post-request-support)
+  - [Watcher tags](#watcher-tags)
+  - [minInterval](#mininterval)
 - [Types](#types)
 - [Helper functions](#helper-functions)
 - [CLI reference](#cli)
@@ -328,6 +345,7 @@ const wd = new WatchDiff(undefined, new SqliteStore(".watchdiff.db"));
 | `storageDir` | `string` | `".watchdiff"` | Directory for JSON snapshot storage |
 | `store` | `IStore` | - | Custom store (e.g. `SqliteStore`). Overrides `storageDir` |
 | `concurrency` | `number` | unlimited | Max simultaneous in-flight checks. See [Concurrency limiting](#concurrency-limiting) |
+| `minInterval` | `number` | `0` | Global floor on minimum seconds between checks. Applied to all watchers that do not set their own `minInterval` |
 
 
 ### `.watch(url, options?)` - chainable
@@ -390,6 +408,11 @@ Register a URL to monitor.
 | `alertOnFirstCheck` | `boolean` | `false` | Fire `onChange` on the very first snapshot capture |
 | `webhookHeaders` | `Record<string, string>` | - | Extra headers merged into every outgoing webhook POST |
 | `retentionDays` | `number` | - | Auto-delete snapshots older than N days after each save |
+| `auth` | `{ user: string; pass: string }` | - | HTTP Basic Auth credentials — adds an `Authorization: Basic` header |
+| `onBeforeCheck` | `fn` | - | Async callback fired before every fetch tick. A thrown error logs a warning but does not skip the check |
+| `requestBody` | `string \| Record<string, unknown>` | - | When set, switches the request method to POST. Objects are JSON-serialised; strings are sent as-is |
+| `tags` | `string[]` | - | Arbitrary tags for grouping watchers. Pass a tag to `wd.pause()` / `wd.resume()` to operate on all matching watchers at once |
+| `minInterval` | `number` | - | Per-watcher floor on minimum seconds between checks. Overrides the global `WatchDiffOptions.minInterval` |
 
 ```typescript
 wd
@@ -1704,6 +1727,108 @@ watchdiff validate --config my.json   # validates a specific file
 ```
 
 
+### HTTP Basic Auth
+
+Pass `auth: { user, pass }` to add an `Authorization: Basic` header to every request for that watcher. The credentials are Base64-encoded automatically.
+
+```typescript
+wd.watch("https://internal.corp/dashboard", {
+  auth: { user: "monitoring", pass: "s3cret" },
+  target: ".metric",
+  interval: 60,
+});
+```
+
+The `auth` option works alongside `headers`, `cookies`, and proxy rotation. It is separate from `webhookHeaders`, which controls outgoing webhook requests rather than inbound fetch requests.
+
+
+### onBeforeCheck hook
+
+`onBeforeCheck` is called once before every fetch tick for a given watcher. It receives the `WatchConfig` and may return a `Promise`. A thrown error is caught and logged as a warning; the check still proceeds.
+
+A common use case is refreshing a short-lived token in `config.headers` before each request:
+
+```typescript
+let token = await fetchToken();
+
+wd.watch("https://api.example.com/prices", {
+  headers: { Authorization: `Bearer ${token}` },
+  onBeforeCheck: async (config) => {
+    token = await fetchToken();               // refresh before each tick
+    config.headers["Authorization"] = `Bearer ${token}`;
+  },
+  interval: 60,
+});
+```
+
+
+### POST request support
+
+Set `requestBody` to switch the HTTP method from GET to POST. Pass a string for raw bodies (e.g. GraphQL queries), or an object for JSON payloads — the object is serialised automatically and a `Content-Type: application/json` header is added.
+
+```typescript
+// JSON POST
+wd.watch("https://api.example.com/graphql", {
+  requestBody: { query: "{ products { id name price } }" },
+  diffMode: "json",
+  interval: 60,
+});
+
+// Raw string body
+wd.watch("https://api.example.com/search", {
+  requestBody: "q=watchdiff&format=json",
+  headers: { "Content-Type": "application/x-www-form-urlencoded" },
+  interval: 300,
+});
+```
+
+
+### Watcher tags
+
+Assign one or more tags to a watcher via `tags: string[]`. Tags are arbitrary strings used for grouping. Pass a tag name to `wd.pause()` or `wd.resume()` to operate on every watcher that carries that tag in a single call.
+
+```typescript
+wd
+  .watch("https://shop.example.com/prices", { tags: ["prod", "prices"], interval: 60 })
+  .watch("https://shop.example.com/stock",  { tags: ["prod", "stock"],  interval: 60 })
+  .watch("https://staging.example.com",     { tags: ["staging"],        interval: 60 });
+
+const stop = wd.start();
+
+// Pause all production watchers at once
+wd.pause("prod");
+
+// Resume only the price watcher group
+wd.resume("prices");
+```
+
+`pause()` and `resume()` first check for a direct URL or stable ID match; if none is found they fall back to matching by tag. A single call may pause or resume multiple watchers when the tag is shared.
+
+
+### minInterval
+
+`minInterval` sets a floor on the minimum seconds that must elapse between two consecutive checks for a watcher. It prevents jitter or very short intervals from scheduling checks faster than you intend.
+
+Set it globally for all watchers via `WatchDiffOptions`:
+
+```typescript
+// No watcher will run more than once every 30 seconds, regardless of its interval or jitter
+const wd = new WatchDiff({ minInterval: 30 });
+```
+
+Or override it per watcher:
+
+```typescript
+wd.watch("https://example.com", {
+  interval: 10,   // requested interval
+  jitter: 0.5,    // ±50% variance
+  minInterval: 5, // but never faster than every 5 seconds
+});
+```
+
+When both a global and per-watcher `minInterval` are set, the per-watcher value takes precedence for that watcher. The floor is applied after jitter is computed.
+
+
 ## Types
 
 ### `DiffReport`
@@ -2140,6 +2265,17 @@ Show runtime state for all watchers defined in a config file:
 watchdiff status
 watchdiff status --config my.json
 watchdiff status --json
+```
+
+### `list` - list configured watchers
+
+Print all configured watchers from a config file without starting the scheduler. Shows label, URL, target, interval or schedule, tags, and paused state.
+
+```bash
+watchdiff list
+watchdiff list --config my.json
+watchdiff list --storage .mydata
+watchdiff list --json    # output a JSON array
 ```
 
 ### `diff` - last stored diff

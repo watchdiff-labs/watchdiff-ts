@@ -231,6 +231,16 @@ export interface WatchConfig {
     webhookHeaders?: Record<string, string>;
     /** Auto-delete snapshots older than N days after each save. */
     retentionDays?: number;
+    /** HTTP Basic Auth credentials - adds an Authorization: Basic header. */
+    auth?: { user: string; pass: string };
+    /** Called before every fetch tick. Throwing logs a warning but does not skip the check. */
+    onBeforeCheck?: (config: WatchConfig) => void | Promise<void>;
+    /** When set, switches the request method to POST. String bodies are sent as-is; objects are JSON-serialised. */
+    requestBody?: string | Record<string, unknown>;
+    /** Arbitrary tags for grouping watchers (e.g. ["prod", "prices"]). Used with pause/resume by tag. */
+    tags?: string[];
+    /** Minimum seconds between two consecutive checks (floor on interval/jitter). */
+    minInterval?: number;
 }
 
 export function makeWatchConfig(
@@ -291,6 +301,11 @@ export function makeWatchConfig(
         alertOnFirstCheck:      opts.alertOnFirstCheck,
         webhookHeaders:         opts.webhookHeaders,
         retentionDays:          opts.retentionDays,
+        auth:                   opts.auth,
+        onBeforeCheck:          opts.onBeforeCheck,
+        requestBody:            opts.requestBody,
+        tags:                   opts.tags,
+        minInterval:            opts.minInterval,
     };
 }
 

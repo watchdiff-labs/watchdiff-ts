@@ -167,6 +167,16 @@ export interface WatchOptions {
     webhookHeaders?: Record<string, string>;
     /** Auto-delete snapshots older than N days after each save. */
     retentionDays?: number;
+    /** HTTP Basic Auth credentials - adds an Authorization: Basic header. */
+    auth?: { user: string; pass: string };
+    /** Async callback fired before every fetch tick. A thrown error logs a warning but does not skip the check. */
+    onBeforeCheck?: (config: WatchConfig) => void | Promise<void>;
+    /** When set, switches the fetcher to POST. String bodies are sent as-is; objects are JSON-serialised. */
+    requestBody?: string | Record<string, unknown>;
+    /** Tags for grouping watchers (e.g. ["prod", "prices"]). Use wd.pause("prod") to pause by group. */
+    tags?: string[];
+    /** Minimum seconds between two consecutive checks (floor on interval/jitter). */
+    minInterval?: number;
 }
 
 export interface WatchFileOptions {
@@ -264,11 +274,14 @@ export interface WatchDiffOptions {
     store?: IStore;
     /** Maximum number of simultaneous in-flight checks (default: unlimited). */
     concurrency?: number;
+    /** Global floor on minimum seconds between checks. Applied to all watchers that don't set their own minInterval. */
+    minInterval?: number;
 }
 
 export class WatchDiff {
     private readonly store: IStore;
     private readonly concurrency: number | undefined;
+    private readonly minInterval: number;
     private readonly configs: WatchConfig[]                                                = [];
     private readonly dbConfigs: DbWatchConfig[]                                           = [];
     private readonly certConfigs: CertWatchConfig[]                                       = [];
@@ -298,10 +311,12 @@ export class WatchDiff {
         if (typeof optsOrStorageDir === "string") {
             this.store       = store ?? new Store(optsOrStorageDir);
             this.concurrency = undefined;
+            this.minInterval = 0;
         } else {
             const opts       = optsOrStorageDir;
             this.store       = opts.store ?? new Store(opts.storageDir ?? ".watchdiff");
             this.concurrency = opts.concurrency;
+            this.minInterval = opts.minInterval ?? 0;
         }
     }
 
@@ -380,6 +395,11 @@ export class WatchDiff {
                 alertOnFirstCheck:    opts.alertOnFirstCheck,
                 webhookHeaders:       opts.webhookHeaders,
                 retentionDays:        opts.retentionDays,
+                auth:                 opts.auth,
+                onBeforeCheck:        opts.onBeforeCheck,
+                requestBody:          opts.requestBody,
+                tags:                 opts.tags,
+                minInterval:          opts.minInterval,
                 alert,
             })
         );
@@ -509,7 +529,7 @@ export class WatchDiff {
         }
 
         if (this.configs.length > 0) {
-            this.scheduler = new Scheduler(this.store, this.concurrency);
+            this.scheduler = new Scheduler(this.store, this.concurrency, this.minInterval);
             for (const cb of this.globalCallbacks) {
                 this.scheduler.addGlobalCallback(cb);
             }
@@ -564,18 +584,20 @@ export class WatchDiff {
     // ------------------------------------------------------------------
 
     /**
-     * Pause the watcher for a URL without removing it.
+     * Pause a watcher by URL, stable ID, or tag.
+     * When the argument matches a tag, all watchers with that tag are paused.
      * No-op if monitoring has not started yet.
      */
-    pause(url: string): void {
-        this.scheduler?.pause(url);
+    pause(urlOrIdOrTag: string): void {
+        this.scheduler?.pause(urlOrIdOrTag);
     }
 
     /**
-     * Resume a previously paused watcher.
+     * Resume a previously paused watcher by URL, stable ID, or tag.
+     * When the argument matches a tag, all watchers with that tag are resumed.
      */
-    resume(url: string): void {
-        this.scheduler?.resume(url);
+    resume(urlOrIdOrTag: string): void {
+        this.scheduler?.resume(urlOrIdOrTag);
     }
 
     // ------------------------------------------------------------------
