@@ -1,7 +1,7 @@
 import { program } from "commander";
 import chalk from "chalk";
 import { writeFileSync, readFileSync, existsSync, readdirSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 import { WatchDiff } from "../index.js";
 import { changeHuman, reportSummary } from "../models.js";
@@ -436,6 +436,16 @@ program
         const wd = new WatchDiff(storage);
         wd.watch(url, { target: opts["target"] });
 
+        // L-3: Path traversal guard on --output
+        if (output) {
+            const resolvedOutput = resolve(output);
+            const cwd = process.cwd();
+            if (!resolvedOutput.startsWith(cwd + sep) && resolvedOutput !== cwd) {
+                console.error(chalk.red(`Output path must be within the current directory: ${output}`));
+                process.exit(1);
+            }
+        }
+
         if (format === "csv") {
             const csv = type === "snapshots"
                 ? wd.exportSnapshotsCsv(url, limit)
@@ -545,7 +555,7 @@ program
         const cfg    = loadConfig(cfgPath);
         const keyOf  = (url: string, target: string | undefined): string => {
             const raw = `${url}::${target ?? ""}`;
-            return createHash("md5").update(raw).digest("hex").slice(0, 12);
+            return createHash("sha256").update(raw).digest("hex").slice(0, 16);
         };
 
         // Collect known hashes from all configured URLs
@@ -566,7 +576,7 @@ program
         const toDelete: string[] = [];
         for (const f of files) {
             // Files are named snap_<hash>.json or report_<hash>.json
-            const match = f.match(/^(?:snap|report)_([a-f0-9]{12})\.json$/);
+            const match = f.match(/^(?:snap|report)_([a-f0-9]{16})\.json$/);
             if (!match) continue;
             const hash = match[1]!;
             if (!knownHashes.has(hash)) {
@@ -698,7 +708,10 @@ program
         if (label) dbOpts.label = label;
 
         const query = opts["query"] as string | undefined;
-        if (query) dbOpts.query = query;
+        if (query) {
+            dbOpts.query = query;
+            console.info("[watchdiff] Custom query provided - it will be validated as a SELECT-only statement at execution time.");
+        }
 
         const threshold = opts["threshold"] ? parseFloat(opts["threshold"] as string) : undefined;
         if (threshold !== undefined) dbOpts.threshold = threshold;

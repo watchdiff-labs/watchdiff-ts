@@ -1,6 +1,16 @@
 import type { ColumnDef, DbWatchConfig, Row } from "../../db-models.js";
 import type { DbFetchResult } from "../index.js";
 
+function assertSelectOnly(query: string): void {
+    if (!/^\s*SELECT\b/i.test(query.trimStart())) {
+        throw new Error(`watchdiff: custom queries must be SELECT statements. Got: ${query.slice(0, 80)}`);
+    }
+    // Block multi-statement injection
+    if (/;\s*\S/.test(query)) {
+        throw new Error("watchdiff: custom queries must not contain multiple statements.");
+    }
+}
+
 export async function fetchSqlite(config: DbWatchConfig): Promise<DbFetchResult> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let Database: new (path: string, opts?: Record<string, unknown>) => any;
@@ -16,6 +26,7 @@ export async function fetchSqlite(config: DbWatchConfig): Promise<DbFetchResult>
 
     try {
         const sql  = config.query ?? `SELECT * FROM ${quote(config.table)}`;
+        if (config.query) assertSelectOnly(sql);
         const rows = db.prepare(sql).all() as Row[];
 
         let schema: ColumnDef[] | undefined;

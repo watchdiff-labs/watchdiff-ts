@@ -241,6 +241,10 @@ export interface WatchConfig {
     tags?: string[];
     /** Minimum seconds between two consecutive checks (floor on interval/jitter). */
     minInterval?: number;
+    /** When true, skip SSRF checks for URLs pointing to private/loopback addresses (for internal monitoring). */
+    allowPrivateUrls?: boolean;
+    /** Maximum response body size in bytes (default: 10MB). Requests exceeding this are aborted. */
+    maxResponseSize?: number;
 }
 
 export function makeWatchConfig(
@@ -306,6 +310,8 @@ export function makeWatchConfig(
         requestBody:            opts.requestBody,
         tags:                   opts.tags,
         minInterval:            opts.minInterval,
+        allowPrivateUrls:       opts.allowPrivateUrls,
+        maxResponseSize:        opts.maxResponseSize,
     };
 }
 

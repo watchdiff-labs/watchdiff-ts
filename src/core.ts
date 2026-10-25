@@ -177,6 +177,10 @@ export interface WatchOptions {
     tags?: string[];
     /** Minimum seconds between two consecutive checks (floor on interval/jitter). */
     minInterval?: number;
+    /** When true, skip SSRF checks for URLs pointing to private/loopback addresses (for internal monitoring). */
+    allowPrivateUrls?: boolean;
+    /** Maximum response body size in bytes (default: 10MB). */
+    maxResponseSize?: number;
 }
 
 export interface WatchFileOptions {
@@ -276,12 +280,15 @@ export interface WatchDiffOptions {
     concurrency?: number;
     /** Global floor on minimum seconds between checks. Applied to all watchers that don't set their own minInterval. */
     minInterval?: number;
+    /** Maximum number of watchers allowed. Throws when exceeded (default: no limit). Recommended max: 1000. */
+    maxWatchers?: number;
 }
 
 export class WatchDiff {
     private readonly store: IStore;
     private readonly concurrency: number | undefined;
     private readonly minInterval: number;
+    private readonly maxWatchers: number | undefined;
     private readonly configs: WatchConfig[]                                                = [];
     private readonly dbConfigs: DbWatchConfig[]                                           = [];
     private readonly certConfigs: CertWatchConfig[]                                       = [];
@@ -312,11 +319,13 @@ export class WatchDiff {
             this.store       = store ?? new Store(optsOrStorageDir);
             this.concurrency = undefined;
             this.minInterval = 0;
+            this.maxWatchers = undefined;
         } else {
             const opts       = optsOrStorageDir;
             this.store       = opts.store ?? new Store(opts.storageDir ?? ".watchdiff");
             this.concurrency = opts.concurrency;
             this.minInterval = opts.minInterval ?? 0;
+            this.maxWatchers = opts.maxWatchers;
         }
     }
 
@@ -328,6 +337,11 @@ export class WatchDiff {
      * Register a URL to monitor. Returns `this` for chaining.
      */
     watch(url: string, opts: WatchOptions = {}): this {
+        // L-1: Enforce maxWatchers limit
+        if (this.maxWatchers && this.configs.length >= this.maxWatchers) {
+            throw new Error(`watchdiff: maxWatchers limit (${this.maxWatchers}) reached`);
+        }
+
         const callbacks = opts.onChange
             ? Array.isArray(opts.onChange)
                 ? opts.onChange
@@ -400,6 +414,8 @@ export class WatchDiff {
                 requestBody:          opts.requestBody,
                 tags:                 opts.tags,
                 minInterval:          opts.minInterval,
+                allowPrivateUrls:     opts.allowPrivateUrls,
+                maxResponseSize:      opts.maxResponseSize,
                 alert,
             })
         );
@@ -737,12 +753,12 @@ export class WatchDiff {
      * Start a built-in HTTP status server.
      * Endpoints: GET /health, /status, /metrics (Prometheus).
      */
-    startStatusServer(port = 9090): void {
+    startStatusServer(port = 9090, bindHost?: string): void {
         if (this.statusServer) {
             console.warn("[watchdiff] Status server already running.");
             return;
         }
-        this.statusServer = new StatusServer();
+        this.statusServer = new StatusServer(bindHost);
         this.statusServer.start(port, () => this.status());
     }
 

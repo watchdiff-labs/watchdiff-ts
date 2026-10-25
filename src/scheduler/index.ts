@@ -743,6 +743,10 @@ export class Scheduler {
                 const windowMs = config.changeSpikeWindow * 1000;
                 state.recentChangeTimes = state.recentChangeTimes.filter((t) => now - t < windowMs);
                 state.recentChangeTimes.push(now);
+                // L-2: Cap recentChangeTimes to prevent unbounded growth
+                if (state.recentChangeTimes.length > 10_000) {
+                    state.recentChangeTimes.shift();
+                }
                 if (
                     state.recentChangeTimes.length >= config.changeSpikeThreshold &&
                     now - state.lastSpikeAt > windowMs
@@ -768,7 +772,7 @@ export class Scheduler {
                 const storeDir   = this.store.getDirectory?.() ?? ".watchdiff";
                 const archiveDir = join(storeDir, "archive");
                 mkdirSync(archiveDir, { recursive: true });
-                const urlHash    = createHash("md5").update(config.url).digest("hex").slice(0, 8);
+                const urlHash    = createHash("sha256").update(config.url).digest("hex").slice(0, 8);
                 const ts         = new Date().toISOString().replace(/[:.]/g, "-");
                 const archivePath = join(archiveDir, `${urlHash}_${ts}.html`);
                 writeFileSync(archivePath, snapshot.rawHtml || html, "utf-8");
@@ -781,7 +785,7 @@ export class Scheduler {
                     const storeDir      = this.store.getDirectory?.() ?? ".watchdiff";
                     const archiveDir    = join(storeDir, "archive");
                     mkdirSync(archiveDir, { recursive: true });
-                    const urlHash       = createHash("md5").update(config.url).digest("hex").slice(0, 8);
+                    const urlHash       = createHash("sha256").update(config.url).digest("hex").slice(0, 8);
                     const ts            = new Date().toISOString().replace(/[:.]/g, "-");
                     const screenshotPath = join(archiveDir, `${urlHash}_${ts}.png`);
                     const buf = await this.browserFetcher.screenshot(config);
@@ -963,6 +967,10 @@ export class Scheduler {
             const windowMs = config.changeSpikeWindow * 1000;
             state.recentChangeTimes = state.recentChangeTimes.filter((t) => now - t < windowMs);
             state.recentChangeTimes.push(now);
+            // L-2: Cap recentChangeTimes to prevent unbounded growth
+            if (state.recentChangeTimes.length > 10_000) {
+                state.recentChangeTimes.shift();
+            }
             if (
                 state.recentChangeTimes.length >= config.changeSpikeThreshold &&
                 now - state.lastSpikeAt > windowMs
@@ -987,7 +995,7 @@ export class Scheduler {
             const storeDir    = this.store.getDirectory?.() ?? ".watchdiff";
             const archiveDir  = join(storeDir, "archive");
             mkdirSync(archiveDir, { recursive: true });
-            const urlHash     = createHash("md5").update(config.url).digest("hex").slice(0, 8);
+            const urlHash     = createHash("sha256").update(config.url).digest("hex").slice(0, 8);
             const ts          = new Date().toISOString().replace(/[:.]/g, "-");
             writeFileSync(join(archiveDir, `${urlHash}_${ts}.html`), snapshot.rawHtml || html, "utf-8");
         }
@@ -997,7 +1005,7 @@ export class Scheduler {
                 const storeDir   = this.store.getDirectory?.() ?? ".watchdiff";
                 const archiveDir = join(storeDir, "archive");
                 mkdirSync(archiveDir, { recursive: true });
-                const urlHash    = createHash("md5").update(config.url).digest("hex").slice(0, 8);
+                const urlHash    = createHash("sha256").update(config.url).digest("hex").slice(0, 8);
                 const ts         = new Date().toISOString().replace(/[:.]/g, "-");
                 const buf        = await this.browserFetcher.screenshot(config);
                 writeFileSync(join(archiveDir, `${urlHash}_${ts}.png`), buf);

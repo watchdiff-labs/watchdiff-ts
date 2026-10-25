@@ -35,6 +35,60 @@ export class FetchError extends Error {
     }
 }
 
+// ---------------------------------------------------------------------------
+// H-1: SSRF guard
+// ---------------------------------------------------------------------------
+
+export function assertSafeUrl(url: string): void {
+    let parsed: URL;
+    try { parsed = new URL(url); } catch {
+        throw new Error(`watchdiff: invalid URL: ${url}`);
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new Error(`watchdiff: only http/https URLs are allowed, got: ${parsed.protocol}`);
+    }
+    const hostname = parsed.hostname.toLowerCase();
+    // Block loopback
+    if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") {
+        throw new Error(`watchdiff: URL points to a loopback address: ${hostname}`);
+    }
+    // Block link-local (AWS metadata, etc.)
+    if (hostname === "169.254.169.254" || hostname.startsWith("169.254.")) {
+        throw new Error(`watchdiff: URL points to a link-local address: ${hostname}`);
+    }
+    // Block private IPv4 ranges (basic check)
+    const privateRanges = [/^10\./, /^172\.(1[6-9]|2\d|3[01])\./, /^192\.168\./];
+    if (privateRanges.some(r => r.test(hostname))) {
+        throw new Error(`watchdiff: URL points to a private network address: ${hostname}`);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M-4: Manual redirect following with hop limit and SSRF check on each hop
+// ---------------------------------------------------------------------------
+
+async function followRedirects(
+    url: string,
+    init: RequestInit,
+    config: WatchConfig,
+    maxHops = 10
+): Promise<Response> {
+    let currentUrl = url;
+    for (let hop = 0; hop < maxHops; hop++) {
+        const resp = await globalThis.fetch(currentUrl, { ...init, redirect: "manual" });
+        if (resp.status >= 300 && resp.status < 400) {
+            const location = resp.headers.get("location");
+            if (!location) return resp;
+            const nextUrl = new URL(location, currentUrl).toString();
+            if (!config.allowPrivateUrls) assertSafeUrl(nextUrl);
+            currentUrl = nextUrl;
+            continue;
+        }
+        return resp;
+    }
+    throw new FetchError(`Too many redirects (max ${maxHops}) for ${url}`);
+}
+
 export class Fetcher {
     async fetch(config: WatchConfig): Promise<string> {
         const result = await this.fetchWithHeaders(config);
@@ -66,11 +120,17 @@ export class Fetcher {
     }
 
     private async attemptFetchWithHeaders(config: WatchConfig): Promise<{ html: string; headers: Record<string, string> }> {
+        // H-1: SSRF guard on the target URL
+        if (!config.allowPrivateUrls) assertSafeUrl(config.url);
+
         const userAgent  = pickRandom(config.userAgents ?? []) ?? pickRandom([...DEFAULT_USER_AGENTS]) ?? FALLBACK_UA;
         const reqHeaders: Record<string, string> = { ...BASE_HEADERS, "User-Agent": userAgent, ...config.headers };
         if (config.cookies && Object.keys(config.cookies).length > 0) {
-            const existing          = reqHeaders["Cookie"] ? reqHeaders["Cookie"] + "; " : "";
-            reqHeaders["Cookie"]    = existing + Object.entries(config.cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+            // M-2: Encode cookie values to prevent header injection
+            const existing       = reqHeaders["Cookie"] ? reqHeaders["Cookie"] + "; " : "";
+            reqHeaders["Cookie"] = existing + Object.entries(config.cookies)
+                .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+                .join("; ");
         }
         // HTTP Basic Auth
         if (config.auth) {
@@ -97,15 +157,15 @@ export class Fetcher {
         try {
             const proxy = pickRandom(config.proxies ?? []);
 
+            // M-4: Use manual redirect following (proxy path keeps its own redirect handling)
             const response = proxy
                 ? await this.fetchWithProxy(config.url, reqHeaders, controller.signal, proxy, method, reqBody)
-                : await globalThis.fetch(config.url, {
+                : await followRedirects(config.url, {
                     method,
                     headers:  reqHeaders,
                     body:     reqBody,
                     signal:   controller.signal,
-                    redirect: "follow",
-                });
+                }, config);
 
             if (!response.ok) {
                 const fetchErr = new FetchError(
@@ -119,7 +179,34 @@ export class Fetcher {
                 throw fetchErr;
             }
 
-            const html = await response.text();
+            // H-2: Enforce maximum response size
+            const MAX = config.maxResponseSize ?? 10 * 1024 * 1024; // 10MB default
+            const contentLength = parseInt(response.headers.get("content-length") ?? "0", 10);
+            if (contentLength > MAX) {
+                throw new FetchError(`Response too large: ${contentLength} bytes (max ${MAX})`);
+            }
+
+            // H-2: Stream body with running total to enforce limit even without Content-Length
+            let html: string;
+            const reader = response.body?.getReader();
+            if (!reader) {
+                html = await response.text(); // fallback for environments without streaming
+            } else {
+                let total = 0;
+                const chunks: Uint8Array[] = [];
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    total += value.length;
+                    if (total > MAX) {
+                        await reader.cancel();
+                        throw new FetchError(`Response too large: exceeded ${MAX} bytes`);
+                    }
+                    chunks.push(value);
+                }
+                html = new TextDecoder().decode(Buffer.concat(chunks));
+            }
+
             const responseHeaders: Record<string, string> = {};
             response.headers.forEach((value, key) => {
                 responseHeaders[key.toLowerCase()] = value;

@@ -1,6 +1,6 @@
 {
   "name": "watchdiff-core",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "description": "Lightweight web change monitoring - diffs, AI summaries, file/API/SSL/DB monitoring, structured alerts.",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -34,7 +34,7 @@
     "change-detection"
   ],
   "author": "",
-  "license": "BSD-2-Clause",
+  "license": "BSD-3-Clause",
   "dependencies": {
     "@xmldom/xmldom": "^0.9.4",
     "chalk": "^5.6.2",

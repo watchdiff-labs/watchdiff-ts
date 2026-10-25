@@ -20,6 +20,7 @@ import {
     type DiffReport,
 } from "../models.js";
 import { sendEmail } from "../mailer/index.js";
+import { assertSafeUrl } from "../fetcher/index.js";
 
 const DEFAULT_WEBHOOK_RETRIES = 3;
 const RETRY_BASE_DELAY_MS     = 500;
@@ -73,12 +74,15 @@ export class Notifier {
             }
         }
         console.warn(
-            `[watchdiff] Webhook failed after ${maxAttempts} attempt(s) (${url}):`,
+            `[watchdiff] Webhook failed after ${maxAttempts} attempt(s) (${redactUrl(url)}):`,
             lastErr
         );
     }
 
     private async sendWebhook(url: string, report: DiffReport, webhookHeaders?: Record<string, string>): Promise<void> {
+        // H-1: SSRF guard on webhook URL
+        assertSafeUrl(url);
+
         const { payload, headers } = this.buildPayload(url, report);
         const res = await globalThis.fetch(url, {
             method:  "POST",
@@ -87,8 +91,10 @@ export class Notifier {
             signal:  AbortSignal.timeout(10_000),
         });
         if (!res.ok) {
-            throw new Error(`Webhook ${url} returned ${res.status}`);
+            throw new Error(`Webhook ${redactUrl(url)} returned ${res.status}`);
         }
+        // I-2: Drain response body to release connection
+        try { await res.body?.cancel(); } catch { /* ignore */ }
     }
 
     private buildPayload(
@@ -185,4 +191,11 @@ export class Notifier {
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// M-3: Redact sensitive URL parts before logging
+function redactUrl(url: string): string {
+    return url
+        .replace(/bot[^/]+\//, "bot<redacted>/")           // Telegram bot token
+        .replace(/(\/\/[^:]+:)[^@]+@/, "$1<redacted>@");   // Basic auth credentials
 }

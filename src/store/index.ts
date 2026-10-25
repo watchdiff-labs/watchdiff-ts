@@ -85,7 +85,7 @@ export class Store implements IStore {
 
     private key(url: string, target: string | undefined): string {
         const raw = `${url}::${target ?? ""}`;
-        return createHash("md5").update(raw).digest("hex").slice(0, 12);
+        return createHash("sha256").update(raw).digest("hex").slice(0, 16);
     }
 
     private snapshotPath(url: string, target: string | undefined): string {

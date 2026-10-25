@@ -15,6 +15,8 @@ type StatusProvider = () => WatcherStatus[];
 export class StatusServer {
     private server: Server | null = null;
 
+    constructor(private readonly bindHost: string = "127.0.0.1") {}
+
     start(port: number, getStatuses: StatusProvider): void {
         this.server = createServer((req, res) => {
             const url = req.url ?? "/";
@@ -43,8 +45,8 @@ export class StatusServer {
             res.end("Not Found");
         });
 
-        this.server.listen(port, () => {
-            console.info(`[watchdiff] Status server listening on http://0.0.0.0:${port}`);
+        this.server.listen(port, this.bindHost, () => {
+            console.info(`[watchdiff] Status server listening on http://${this.bindHost}:${port}`);
         });
 
         this.server.unref();

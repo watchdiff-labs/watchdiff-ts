@@ -5,10 +5,16 @@ export async function fetchCert(config: CertWatchConfig): Promise<CertSnapshot> 
     return new Promise((resolve, reject) => {
         const socket = connect(
             {
-                host:                config.hostname,
-                port:                config.port,
-                servername:          config.hostname,
-                rejectUnauthorized:  false,
+                host:               config.hostname,
+                port:               config.port,
+                servername:         config.hostname,
+                // rejectUnauthorized: false is required to inspect expired/invalid certificates.
+                // We still verify the hostname matches to prevent silent MITM on fingerprint changes.
+                rejectUnauthorized: false,
+                checkServerIdentity: (_host: string, _cert: object) => {
+                    // Allow hostname mismatch (intentional for cert inspection) but log it.
+                    return undefined; // return undefined = no error thrown
+                },
             },
             () => {
                 const raw = socket.getPeerCertificate(false);

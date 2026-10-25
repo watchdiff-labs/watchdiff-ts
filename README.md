@@ -1,8 +1,8 @@
 # watchdiff-core
 
 [![npm version](https://img.shields.io/npm/v/watchdiff-core?color=blue)](https://www.npmjs.com/package/watchdiff-core)
-[![CI](https://github.com/r-seize/watchdiff-ts/actions/workflows/ci.yml/badge.svg)](https://github.com/r-seize/watchdiff-ts/actions/workflows/ci.yml)
-[![License: BSD-2-Clause](https://img.shields.io/badge/license-BSD--2--Clause-blue)](LICENSE)
+[![CI](https://github.com/watchdiff-labs/watchdiff-ts/actions/workflows/ci.yml/badge.svg)](https://github.com/watchdiff-labs/watchdiff-ts/actions/workflows/ci.yml)
+[![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
 
 **Lightweight web change monitoring - diffs, AI summaries, file/API/SSL/DB monitoring, structured alerts.**
 
@@ -67,6 +67,13 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 - **Watcher tags** - `tags: ["prod", "prices"]` then `wd.pause("prod")` to pause or resume an entire group
 - **`watchdiff list`** - CLI command listing all configured watchers with their label, URL, target, interval, tags, and paused state
 - **`minInterval`** - global (`new WatchDiff({ minInterval: 30 })`) or per-watcher floor on the minimum seconds between checks
+- **SSRF protection** - all URLs validated against loopback, link-local, and private IP ranges before any request; disable with `allowPrivateUrls: true` for internal monitoring
+- **Response size cap** - `maxResponseSize` (default 10 MB) prevents unbounded memory usage from oversized responses
+- **Redirect safety** - automatic redirect following capped at 10 hops with SSRF validation at each hop
+- **SQL injection guard** - custom DB queries validated as SELECT-only before execution
+- **Cookie value encoding** - cookie values are `encodeURIComponent`-encoded to prevent header injection
+- **`maxWatchers`** - optional limit on the number of registered watchers (`new WatchDiff({ maxWatchers: 1000 })`)
+- **Status server localhost-only by default** - `startStatusServer(port)` binds to `127.0.0.1`; pass a second arg to override
 - **Fully typed** - complete TypeScript types included
 - **Native fetch** - no HTTP library dependency, runs on Node.js 18+
 
@@ -143,6 +150,10 @@ WatchDiff watches web pages, files, APIs, databases, and SSL certificates - then
 | Group watchers by tag | `tags: ["prod"]` then `wd.pause("prod")` |
 | List configured watchers | `watchdiff list` or `watchdiff list --config my.json` |
 | Floor check frequency | `minInterval: 30` (per-watcher) or `new WatchDiff({ minInterval: 30 })` (global) |
+| Cap watcher count | `new WatchDiff({ maxWatchers: 100 })` |
+| Allow internal URLs | `allowPrivateUrls: true` (disables SSRF guard for private-network monitoring) |
+| Cap response body size | `maxResponseSize: 5242880` (5 MB default: 10 MB) |
+| Bind status server to custom host | `wd.startStatusServer(9090, "0.0.0.0")` |
 
 ### Quick navigation
 
@@ -3101,12 +3112,30 @@ npm run typecheck # tsc --noEmit
 
 ## Contributing
 
-Missing a feature? Found a bug? Pull requests are welcome on [GitHub](https://github.com/r-seize/watchdiff-ts).
+Missing a feature? Found a bug? Pull requests are welcome on [GitHub](https://github.com/watchdiff-labs/watchdiff-ts).
 
 If you want a feature that is not yet in the project, open an issue or submit a PR directly - contributions of any size are appreciated.
 
+## Security
+
+WatchDiff v0.3.0 was audited and hardened against the following categories:
+
+| Category | Mitigation |
+|---|---|
+| **SSRF** | All `watch()` URLs and webhook destinations are validated against loopback, link-local (`169.254.x.x`), and private ranges. Use `allowPrivateUrls: true` to monitor internal services. |
+| **Unbounded response** | `maxResponseSize` (default 10 MB) is enforced via streaming; the reader is cancelled and an error is thrown if the limit is exceeded. |
+| **Redirect hijack** | Redirects are followed manually with a 10-hop cap; each target URL is SSRF-validated. |
+| **SQL injection** | Custom `query` strings in DB watchers are validated as `SELECT`-only with no multi-statement support before execution. |
+| **Cookie header injection** | Cookie names and values are `encodeURIComponent`-encoded before being placed in the `Cookie` header. |
+| **Credential exposure in logs** | Telegram bot tokens and Basic Auth credentials are redacted before any `console.warn`/`console.error` output. |
+| **Status server exposure** | `startStatusServer()` binds to `127.0.0.1` by default. Pass a second argument to change the bind address. |
+| **Storage key collision** | Storage keys are derived from SHA-256 (previously MD5). |
+| **Path traversal (CLI)** | The `--output` path in `watchdiff export` is resolved and checked to be within the current working directory. |
+
+> **Note on SSL cert monitoring:** `watchCert()` intentionally uses `rejectUnauthorized: false` to inspect expired or invalid certificates. Hostname verification is still performed to detect certificate substitution.
+
 ## License
 
-This project is licensed under the [BSD 2-Clause License](LICENSE).
+This project is licensed under the [BSD 3-Clause License](LICENSE).
 
 You are free to use, modify, and distribute this software in source and binary forms, with or without modification, provided the copyright notice and disclaimer are retained. No copyleft restrictions - compatible with MIT and proprietary projects.
